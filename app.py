@@ -52,6 +52,7 @@ defaults = {
     'history': None,
     'dataset_path': None,
     'temp_dir': None,
+    'val_loader': None,
     'dataset_loaded': False
 }
 for key, value in defaults.items():
@@ -320,6 +321,7 @@ def process_uploaded_zip(uploaded_file):
     st.session_state.model = None
     st.session_state.history = None
     st.session_state.class_names = []
+    st.session_state.val_loader = None
     
     # Create temp directory and extract ZIP
     tmp_dir = tempfile.mkdtemp()
@@ -552,6 +554,206 @@ def display_dataset_summary(dataset_path):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# P5 — EVALUATION & GRAD-CAM FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_predictions(model, val_loader):
+    """Run inference on validation set, return predictions, probabilities, and true labels."""
+    model.eval()
+    all_preds = []
+    all_probs = []
+    all_labels = []
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(DEVICE)
+            outputs = model(images)
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(labels.numpy())
+
+    return np.array(all_preds), np.array(all_probs), np.array(all_labels)
+
+
+def plot_confusion_matrix(model, val_loader, class_names):
+    """Generate confusion matrix heatmap with dark theme."""
+    y_pred, _, y_true = get_predictions(model, val_loader)
+
+    cm = confusion_matrix(y_true, y_pred)
+    labels = [c.replace('_', ' ').title() for c in class_names]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.patch.set_facecolor('#0a0a0f')
+    ax.set_facecolor('#111827')
+
+    sns.heatmap(
+        cm, annot=True, fmt='d', cmap='Blues',
+        xticklabels=labels, yticklabels=labels,
+        ax=ax, linewidths=0.5, linecolor='#1f2937'
+    )
+
+    ax.set_title('Confusion Matrix \u2014 Validation Set',
+                 color='white', fontsize=14, pad=20)
+    ax.set_xlabel('Predicted Label', color='#94a3b8', labelpad=10)
+    ax.set_ylabel('True Label', color='#94a3b8', labelpad=10)
+
+    plt.xticks(rotation=45, ha='right', color='#94a3b8')
+    plt.yticks(rotation=0, color='#94a3b8')
+
+    plt.tight_layout()
+    return fig
+
+
+def display_classification_report(model, val_loader, class_names):
+    """Display classification report as styled DataFrame."""
+    y_pred, _, y_true = get_predictions(model, val_loader)
+
+    labels = [c.replace('_', ' ').title() for c in class_names]
+    report_dict = classification_report(
+        y_true, y_pred,
+        target_names=labels,
+        output_dict=True
+    )
+
+    df = pd.DataFrame(report_dict).transpose()
+    df = df.drop(['accuracy'], errors='ignore')
+    df = df.round(3)
+
+    st.dataframe(
+        df.style
+          .background_gradient(
+              cmap='Blues',
+              subset=['precision', 'recall', 'f1-score'])
+          .format({
+              'precision': '{:.3f}',
+              'recall': '{:.3f}',
+              'f1-score': '{:.3f}',
+              'support': '{:.0f}'
+          }),
+        use_container_width=True
+    )
+
+
+def plot_roc_curves(model, val_loader, class_names):
+    """Generate ROC curves (One-vs-Rest) with AUC scores."""
+    _, y_pred_probs, y_true = get_predictions(model, val_loader)
+    num_classes = len(class_names)
+
+    y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.patch.set_facecolor('#0a0a0f')
+    ax.set_facecolor('#111827')
+
+    palette = ['#667eea', '#764ba2', '#06b6d4', '#10b981',
+               '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899']
+
+    for i, (name, color) in enumerate(zip(class_names, palette)):
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred_probs[:, i])
+        roc_auc = auc(fpr, tpr)
+        label = f"{name.replace('_', ' ').title()} (AUC = {roc_auc:.2f})"
+        ax.plot(fpr, tpr, color=color, linewidth=2, label=label)
+
+    ax.plot([0, 1], [0, 1], 'white', linestyle='--', alpha=0.3, linewidth=1)
+    ax.set_xlabel('False Positive Rate', color='#94a3b8')
+    ax.set_ylabel('True Positive Rate', color='#94a3b8')
+    ax.set_title('ROC Curves \u2014 One-vs-Rest', color='white', fontsize=14)
+    ax.legend(loc='lower right', fontsize=8,
+              facecolor='#1f2937', labelcolor='white', framealpha=0.8)
+    ax.tick_params(colors='#94a3b8')
+    ax.grid(True, alpha=0.1)
+
+    plt.tight_layout()
+    return fig
+
+
+def get_last_conv_layer(model):
+    """Find the last Conv2d layer in MobileNetV2 features backbone."""
+    last_conv = None
+    for module in model.base_model.features.modules():
+        if isinstance(module, nn.Conv2d):
+            last_conv = module
+    if last_conv is None:
+        raise ValueError("No Conv2d layer found in model.")
+    return last_conv
+
+
+def generate_gradcam(model, img_tensor, class_idx):
+    """
+    Generate Grad-CAM heatmap and overlay using PyTorch hooks.
+    Returns (heatmap_colored, overlay) as numpy uint8 arrays.
+    """
+    model.eval()
+
+    activations = []
+    gradients = []
+
+    target_layer = get_last_conv_layer(model)
+
+    # Hooks to capture activations and gradients
+    def forward_hook(module, input, output):
+        activations.append(output.detach())
+
+    def backward_hook(module, grad_input, grad_output):
+        gradients.append(grad_output[0].detach())
+
+    fwd_handle = target_layer.register_forward_hook(forward_hook)
+    bwd_handle = target_layer.register_full_backward_hook(backward_hook)
+
+    # Forward pass — need requires_grad on input so gradients flow through frozen layers
+    img_input = img_tensor.clone().requires_grad_(True)
+    output = model(img_input)
+
+    # Backward pass for target class
+    model.zero_grad()
+    target_score = output[0, class_idx]
+    target_score.backward()
+
+    # Remove hooks
+    fwd_handle.remove()
+    bwd_handle.remove()
+
+    # Compute Grad-CAM
+    activation = activations[0][0]  # (C, H, W)
+    gradient = gradients[0][0]      # (C, H, W)
+
+    # Pool gradients across spatial dimensions
+    pooled_grads = torch.mean(gradient, dim=(1, 2))  # (C,)
+
+    # Weight each feature map by its gradient importance
+    for i in range(activation.shape[0]):
+        activation[i] *= pooled_grads[i]
+
+    heatmap = torch.mean(activation, dim=0)  # (H, W)
+    heatmap = torch.relu(heatmap)  # ReLU — retain only positive influence
+    heatmap = heatmap / (torch.max(heatmap) + 1e-8)  # Normalize (refinement #13)
+    heatmap = heatmap.cpu().numpy()
+
+    # Resize to image dimensions
+    heatmap_resized = cv2.resize(heatmap, (128, 128))
+
+    # Apply JET colormap: blue=low importance, red=high importance
+    heatmap_colored = np.uint8(255 * heatmap_resized)
+    heatmap_colored = cv2.applyColorMap(heatmap_colored, cv2.COLORMAP_JET)
+    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+
+    # Denormalize original image (undo ImageNet normalization)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    img_denorm = img_tensor[0].cpu() * std + mean
+    img_denorm = torch.clamp(img_denorm, 0, 1)
+    original = np.uint8(img_denorm.permute(1, 2, 0).numpy() * 255)
+
+    # Blend heatmap with original image
+    overlay = cv2.addWeighted(original, 0.6, heatmap_colored, 0.4, 0)
+
+    return heatmap_colored, overlay
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # PAGE SECTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -717,6 +919,7 @@ if st.session_state.dataset_loaded and not st.session_state.trained:
             st.session_state.trained = True
             st.session_state.history = history
             st.session_state.class_names = class_names
+            st.session_state.val_loader = val_loader
             
             st.success("✅ Training complete!")
 
@@ -785,18 +988,140 @@ if st.session_state.trained and st.session_state.history:
     
     st.markdown("---")
 
-# ── SECTION 5: MODEL EVALUATION (P5 Placeholder) ─────────────────────────────
-if st.session_state.trained:
-    st.markdown('<h2 class="section-header">📊 Model Evaluation (P5)</h2>', 
+# ── SECTION 5: MODEL EVALUATION ──────────────────────────────────────────────
+if st.session_state.trained and st.session_state.val_loader is not None:
+    st.markdown('<h2 class="section-header">📊 Model Evaluation</h2>',
                 unsafe_allow_html=True)
-    st.info("Evaluation metrics will be displayed here in Practical 5 (Confusion Matrix, Classification Report, etc.)")
+
+    _eval_model = st.session_state.model
+    _eval_val_loader = st.session_state.val_loader
+    _eval_class_names = st.session_state.class_names
+
+    # ── Confusion Matrix ──
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.write("**Confusion Matrix**")
+    fig_cm = plot_confusion_matrix(_eval_model, _eval_val_loader, _eval_class_names)
+    st.pyplot(fig_cm)
+    plt.close()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Classification Report ──
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.write("**Classification Report**")
+    display_classification_report(_eval_model, _eval_val_loader, _eval_class_names)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── ROC Curves ──
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.write("**ROC Curves (One-vs-Rest)**")
+    fig_roc = plot_roc_curves(_eval_model, _eval_val_loader, _eval_class_names)
+    st.pyplot(fig_roc)
+    plt.close()
+    st.markdown('</div>', unsafe_allow_html=True)
+
     st.markdown("---")
 
-# ── SECTION 6: PREDICTION + GRAD-CAM (P5 Placeholder) ────────────────────────
+# ── SECTION 6: PREDICTION + GRAD-CAM ─────────────────────────────────────────
 if st.session_state.trained:
-    st.markdown('<h2 class="section-header">🔮 Pose Prediction (P5)</h2>', 
+    st.markdown('<h2 class="section-header">🔮 Pose Prediction & Grad-CAM</h2>',
                 unsafe_allow_html=True)
-    st.info("Prediction UI with Grad-CAM visualization will be available in Practical 5")
+
+    pred_image = st.file_uploader(
+        "Upload a yoga pose image to classify",
+        type=['jpg', 'jpeg', 'png'],
+        key='prediction_upload'
+    )
+
+    if pred_image:
+        _pred_model = st.session_state.model
+        _pred_class_names = st.session_state.class_names
+
+        # Load and prepare image
+        img = Image.open(pred_image).convert('RGB')
+        img_resized = img.resize((128, 128))
+
+        # Prepare tensor with validation transforms
+        pred_transform = transforms.Compose([
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+        img_tensor = pred_transform(img).unsqueeze(0).to(DEVICE)
+
+        # Predict
+        _pred_model.eval()
+        with torch.no_grad():
+            outputs = _pred_model(img_tensor)
+            probs = torch.softmax(outputs, dim=1)
+
+        class_idx = int(torch.argmax(probs[0]).item())
+        confidence = float(probs[0][class_idx].item())
+        predicted_class = _pred_class_names[class_idx]
+        display_name = predicted_class.replace('_', ' ').title()
+        sanskrit = sanskrit_names.get(predicted_class, '')
+
+        # Generate Grad-CAM
+        heatmap, overlay = generate_gradcam(_pred_model, img_tensor, class_idx)
+
+        # Prediction badge
+        st.markdown(f"""
+        <div class="pose-badge">
+            🧘 {display_name} &nbsp;|&nbsp;
+            <em>{sanskrit}</em> &nbsp;|&nbsp;
+            Confidence: {confidence:.1%}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Three-column image display
+        c1, c2, c3 = st.columns(3)
+        c1.image(img_resized,   caption="📷 Original",          use_container_width=True)
+        c2.image(heatmap,       caption="🔥 Grad-CAM Heatmap",  use_container_width=True)
+        c3.image(overlay,       caption="🔍 Overlay",           use_container_width=True)
+
+        # Probability bar chart
+        predictions_np = probs[0].cpu().numpy()
+        prob_df = pd.DataFrame({
+            'Pose': [c.replace('_', ' ').title() for c in _pred_class_names],
+            'Confidence': predictions_np
+        }).sort_values('Confidence', ascending=True)
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        fig.patch.set_facecolor('#0a0a0f')
+        ax.set_facecolor('#111827')
+        bar_colors = [
+            '#10b981' if p == display_name else '#667eea'
+            for p in prob_df['Pose']
+        ]
+        ax.barh(prob_df['Pose'], prob_df['Confidence'],
+                color=bar_colors, edgecolor='none')
+        ax.set_xlabel('Confidence', color='#94a3b8')
+        ax.set_title('Class Probability Distribution',
+                     color='white', fontsize=12)
+        ax.tick_params(colors='#94a3b8')
+        ax.grid(True, axis='x', alpha=0.15)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # Pose info card
+        info = pose_info.get(predicted_class, {})
+        if info:
+            st.markdown(f"""
+            <div class="info-card">
+                <h4>📋 {display_name} ({sanskrit})</h4>
+                <p><strong>Benefits:</strong> {info['benefits']}</p>
+                <p><strong>Form Cues:</strong> {info['cues']}</p>
+                <p><strong>Difficulty:</strong> {info['difficulty']}</p>
+                <hr style="opacity:0.2">
+                <p style="opacity:0.5; font-size:0.75em;">
+                ⚠️ This tool supports beginner practitioners.
+                It does not replace certified yoga instruction.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("---")
 
 # Footer
 st.markdown("---")
