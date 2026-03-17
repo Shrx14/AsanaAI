@@ -19,7 +19,7 @@ Streamlit application that trains a MobileNetV2-based classifier on eight yoga p
 ## Quickstart
 1. **Install dependencies**
    ```bash
-   cd /home/runner/work/AsanaAI/AsanaAI
+   cd AsanaAI
    python -m venv .venv && source .venv/bin/activate
    pip install -r requirements.txt
    ```
