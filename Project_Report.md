@@ -131,3 +131,29 @@ for epoch in range(EPOCHS):
 - Add data-quality checks (blur/pose detection) before training.
 - Export best checkpoint for reuse without retraining each session.
 - Introduce lightweight pose estimation overlay for richer cues.
+
+## 12) Architecture Diagrams (Mermaid)
+
+### a) End-to-End Pipeline (chalkboard flow)
+```mermaid
+flowchart LR
+    A[Application selection & design] --> B[Dataset selection\n(Kaggle yoga poses, 8 classes)]
+    B --> C[EDA & Visualization\n(Python, class counts, samples)]
+    C --> D[Pre-processing\n(Resize 128x128, normalization,\ntrain augmentations)]
+    D --> E[Training neural network\nMobileNetV2 + custom head]
+```
+
+### b) System Components (Streamlit App)
+```mermaid
+flowchart LR
+    UI[Streamlit UI] -->|Upload zip| ZIP[Zip processor\nunzips yoga_dataset]
+    UI -->|Begin Training| TRAINER[Training loop\nPyTorch + MobileNetV2]
+    ZIP --> DATA[DataLoaders\ntrain/val splits]
+    DATA --> TRAINER
+    TRAINER --> HIST[History\nloss/accuracy]
+    TRAINER --> MODEL[Trained model]
+    MODEL --> CAM[Grad-CAM explainer]
+    UI -->|Upload pose image| CAM
+    CAM -->|Heatmap & overlay| UI
+    HIST -->|Charts/metrics| UI
+```
