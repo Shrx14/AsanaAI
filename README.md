@@ -15,6 +15,7 @@ Streamlit application that trains a MobileNetV2-based classifier on eight yoga p
 - `requirements.txt` — runtime dependencies
 - `verify_pytorch_conversion.py` — optional environment sanity check
 - `AsanaAI_Final_Plan.md` — background plan and rationale
+- `Project_Report.md` — concise end-to-end project report (problem, data, pipeline, metrics)
 
 ## Quickstart
 1. **Install dependencies**
