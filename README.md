@@ -39,7 +39,7 @@ Streamlit application that trains a MobileNetV2-based classifier on eight yoga p
    - Click **“Begin Training”** in the UI. Training history and early stopping are handled automatically.
 5. **Evaluate & explain**
    - Review accuracy/loss curves, confusion matrix, classification report, and ROC curves.
-   - Upload a pose image to see predictions with Grad-CAM heatmaps and overlayed explanations.
+   - Upload a pose image to see predictions with Grad-CAM heatmaps and overlaid explanations.
 
 ## Optional: quick environment verification
 Run the smoke test to confirm PyTorch, data pipeline, and model wiring:
