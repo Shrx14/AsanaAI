@@ -1,53 +1,120 @@
-# AsanaAI — Explainable Yoga Pose Recognition
+# AsanaAI - Explainable Yoga Pose Recognition
 
-Streamlit application that trains a MobileNetV2-based classifier on eight yoga poses and explains predictions with Grad-CAM overlays. Built for CELBC608 — Data Science Laboratory.
+AsanaAI is a Streamlit application that classifies yoga poses from images using a PyTorch MobileNetV2 model and explains predictions with Grad-CAM overlays.
 
-## Features
-- Upload a zipped dataset (`yoga_dataset.zip`) with `train/` and `val/` splits
-- Transfer-learning pipeline (PyTorch) with early stopping and accuracy/loss tracking
-- Metrics dashboard with confusion matrix, classification report, and ROC curves
-- Pose prediction with Grad-CAM visual explanations and practice cues
-- GPU auto-detection (falls back to CPU if unavailable)
+## What the app does
 
-## Repository layout
-- `app.py` — Streamlit UI, training loop, evaluation visuals, and Grad-CAM
-- `yoga_dataset.zip` — ready-to-use sample dataset (8 classes, 80/20 split)
-- `requirements.txt` — runtime dependencies
-- `verify_pytorch_conversion.py` — optional environment sanity check
-- `AsanaAI_Final_Plan.md` — background plan and rationale
-- `Project_Report.md` — concise end-to-end project report (problem, data, pipeline, metrics)
+- Loads an existing trained checkpoint automatically (if available)
+- Uploads a ZIP dataset (`train/` and `val/`) for training/retraining
+- Trains a transfer learning model with early stopping
+- Shows learning curves and full evaluation metrics
+- Predicts a pose from a single image with:
+  - Top-3 probabilities
+  - Full class probability chart
+  - Grad-CAM heatmap and overlay
+  - Pose guidance (Sanskrit name, benefits, cues, difficulty)
 
-## Quickstart
-1. **Install dependencies**
-   ```bash
-   cd AsanaAI
-   python -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-2. **Launch the app**
-   ```bash
-   streamlit run app.py
-   ```
-3. **Load data**
-   - Use the bundled `yoga_dataset.zip`, or supply your own ZIP with structure:
-     ```
-     yoga_dataset/
-       train/<class_name>/*.jpg|png
-       val/<class_name>/*.jpg|png
-     ```
-   - The bundled dataset covers eight poses (downward_dog, warrior, tree, cobra, plank, triangle, child_pose, seated_forward_bend) with 96 train and 24 val images per class.
-4. **Train**
-   - Click **“Begin Training”** in the UI. Training history and early stopping are handled automatically.
-5. **Evaluate & explain**
-   - Review accuracy/loss curves, confusion matrix, classification report, and ROC curves.
-   - Upload a pose image to see predictions with Grad-CAM heatmaps and overlaid explanations.
+## Repository structure
 
-## Optional: quick environment verification
-Run the smoke test to confirm PyTorch, data pipeline, and model wiring:
+- `app.py` - Streamlit app, model pipeline, Grad-CAM, and UI
+- `requirements.txt` - Python dependencies
+- `verify_pytorch_conversion.py` - Optional environment/model sanity check
+- `yoga_dataset.zip` - Sample curated dataset (8 classes)
+- `AsanaAI_Final_Plan.md` - Final implementation plan and execution mapping
+- `Project_Report.md` - Project report for Practicals 4 and 5
+
+## Tech stack
+
+- Python 3.10+
+- Streamlit
+- PyTorch + Torchvision (MobileNetV2)
+- NumPy, Pandas, Matplotlib, Seaborn
+- OpenCV
+- scikit-learn
+
+## Setup
+
+1. Create and activate a virtual environment.
+
+Windows PowerShell:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+macOS/Linux:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+2. Install dependencies.
+```bash
+pip install -r requirements.txt
+```
+
+3. Launch the app.
+```bash
+streamlit run app.py
+```
+
+## Dataset format
+
+Upload a ZIP that contains a root folder with this structure:
+
+```text
+yoga_dataset/
+  train/
+    class_name_1/*.jpg|jpeg|png
+    class_name_2/*.jpg|jpeg|png
+    ...
+  val/
+    class_name_1/*.jpg|jpeg|png
+    class_name_2/*.jpg|jpeg|png
+    ...
+```
+
+The bundled dataset uses 8 classes:
+
+- downward_dog
+- warrior
+- tree
+- cobra
+- plank
+- triangle
+- child_pose
+- seated_forward_bend
+
+## Runtime behavior
+
+- If `asanai_saved/model_weights.pt`, `asanai_saved/training_history.json`, and `asanai_saved/class_names.json` exist, the app auto-loads the model.
+- Prediction section is available immediately when a model is loaded.
+- Evaluation charts require a validation loader, so upload the dataset ZIP when using a loaded checkpoint.
+
+## Saved artifacts
+
+Training writes these files under `asanai_saved/`:
+
+- `model_weights.pt`
+- `training_history.json`
+- `class_names.json`
+
+## Training defaults (from app constants)
+
+- Image size: 128 x 128
+- Batch size: 16
+- Epochs: 10
+- Early stopping patience: 3
+- Optimizer LR: 1e-3
+
+## Optional verification
+
+Run the helper script:
+
 ```bash
 python verify_pytorch_conversion.py
 ```
 
-## Notes
-- GPU is recommended for faster training; CPU mode also works (slower).
-- The app does not bundle pre-trained weights; training occurs after you upload a dataset ZIP.
+## Disclaimer
+
+AsanaAI is an educational aid for beginner yoga practitioners. It does not replace certified yoga instruction.

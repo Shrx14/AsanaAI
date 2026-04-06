@@ -1,1133 +1,1222 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# AsanaAI — Practical 4 & 5
+# AsanaAI — Practicals 4 & 5
 # Explainable Deep Learning System for Yoga Pose Recognition
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ── IMPORTS ──────────────────────────────────────────────────────────────────
 import streamlit as st
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import models, transforms
-from torch.utils.data import DataLoader, Dataset
+import copy
+import json
+import os
+import zipfile
+import tempfile
+import shutil
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import cv2
-import os
-import zipfile
-import tempfile
-import shutil
-from pathlib import Path
-from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.metrics import roc_curve, auc
+
+from torchvision import models, transforms
+from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 from PIL import Image
 
-# ── GPU SETUP ────────────────────────────────────────────────────────────────
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-GPU_AVAILABLE = torch.cuda.is_available()
+# ── CONSTANTS ────────────────────────────────────────────────────────────────
+SAVE_DIR     = "asanai_saved"
+MODEL_PATH   = os.path.join(SAVE_DIR, "model_weights.pt")
+HISTORY_PATH = os.path.join(SAVE_DIR, "training_history.json")
+CLASSES_PATH = os.path.join(SAVE_DIR, "class_names.json")
+IMG_SIZE     = 128
+BATCH_SIZE   = 16
+EPOCHS       = 10
+PATIENCE     = 3
+LR           = 1e-3
 
-if GPU_AVAILABLE:
-    print(f"✅ GPU Available: {torch.cuda.get_device_name(0)}")
-    print(f"   CUDA Version: {torch.version.cuda}")
-    print(f"   Device: {DEVICE}")
-else:
-    print("⚠️ GPU not available, using CPU")
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ── GPU SETUP ────────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+GPU_AVAILABLE = torch.cuda.is_available()
 
 # ── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AsanaAI",
     page_icon="🧘",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 # ── SESSION STATE DEFAULTS ───────────────────────────────────────────────────
-defaults = {
-    'model': None,
-    'trained': False,
-    'class_names': [],
-    'history': None,
-    'dataset_path': None,
-    'temp_dir': None,
-    'val_loader': None,
-    'dataset_loaded': False
+_defaults = {
+    "model":          None,
+    "trained":        False,
+    "class_names":    [],
+    "history":        None,
+    "dataset_path":   None,
+    "val_loader":     None,
+    "dataset_loaded": False,
+    "temp_dir":       None,
+    "model_source":   None,   # "file" | "trained"
 }
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ── REFERENCE DICTIONARIES ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# REFERENCE DATA
+# ═══════════════════════════════════════════════════════════════════════════
+
 sanskrit_names = {
-    'downward_dog': 'Adho Mukha Svanasana',
-    'warrior': 'Virabhadrasana I',
-    'tree': 'Vrikshasana',
-    'cobra': 'Bhujangasana',
-    'plank': 'Phalakasana',
-    'triangle': 'Trikonasana',
-    'child_pose': 'Balasana',
-    'seated_forward_bend': 'Paschimottanasana'
+    "downward_dog":        "Adho Mukha Svanasana",
+    "warrior":             "Virabhadrasana I",
+    "tree":                "Vrikshasana",
+    "cobra":               "Bhujangasana",
+    "plank":               "Phalakasana",
+    "triangle":            "Trikonasana",
+    "child_pose":          "Balasana",
+    "seated_forward_bend": "Paschimottanasana",
 }
 
 pose_info = {
-    'downward_dog': {
-        'benefits': 'Stretches hamstrings, calves, and spine. Strengthens arms and legs. Relieves back pain.',
-        'cues': 'Press heels toward floor. Keep spine long. Relax neck between arms.',
-        'difficulty': 'Beginner'
+    "downward_dog": {
+        "benefits":   "Stretches hamstrings, calves, and spine. Strengthens arms and legs. Relieves back pain.",
+        "cues":       "Press heels toward the floor. Keep spine long. Relax neck between arms.",
+        "difficulty": "Beginner",
+        "color":      "#667eea",
     },
-    'warrior': {
-        'benefits': 'Builds strength in legs and core. Improves balance and focus. Opens hips and chest.',
-        'cues': 'Front knee directly over ankle. Back foot at 45 degrees. Arms parallel to floor.',
-        'difficulty': 'Beginner'
+    "warrior": {
+        "benefits":   "Builds strength in legs and core. Improves balance and focus. Opens hips and chest.",
+        "cues":       "Front knee directly over ankle. Back foot at 45°. Arms parallel to floor.",
+        "difficulty": "Beginner",
+        "color":      "#f59e0b",
     },
-    'tree': {
-        'benefits': 'Improves balance and concentration. Strengthens ankles and calves. Opens hip of raised leg.',
-        'cues': 'Fix gaze on a still point. Press foot into inner thigh. Avoid locking standing knee.',
-        'difficulty': 'Beginner'
+    "tree": {
+        "benefits":   "Improves balance and concentration. Strengthens ankles and calves. Opens hip of raised leg.",
+        "cues":       "Fix gaze on a still point. Press foot into inner thigh. Avoid locking standing knee.",
+        "difficulty": "Beginner",
+        "color":      "#10b981",
     },
-    'cobra': {
-        'benefits': 'Strengthens spine and back muscles. Opens chest and shoulders. Stimulates abdominal organs.',
-        'cues': 'Keep elbows close to body. Do not crunch neck. Lift chest using back muscles not arms.',
-        'difficulty': 'Beginner'
+    "cobra": {
+        "benefits":   "Strengthens spine and back muscles. Opens chest and shoulders. Stimulates abdominal organs.",
+        "cues":       "Keep elbows close to body. Do not crunch neck. Lift chest using back muscles, not arms.",
+        "difficulty": "Beginner",
+        "color":      "#ef4444",
     },
-    'plank': {
-        'benefits': 'Builds core strength. Tones arms, wrists, and spine. Improves posture.',
-        'cues': 'Body forms straight line head to heel. Engage core. Do not let hips sag or rise.',
-        'difficulty': 'Beginner'
+    "plank": {
+        "benefits":   "Builds core strength. Tones arms, wrists, and spine. Improves posture.",
+        "cues":       "Body forms a straight line head to heel. Engage core. Do not let hips sag or rise.",
+        "difficulty": "Beginner",
+        "color":      "#8b5cf6",
     },
-    'triangle': {
-        'benefits': 'Stretches legs, hips, and spine. Opens chest. Improves digestion and relieves stress.',
-        'cues': 'Keep both legs straight. Stack shoulders vertically. Look up at raised hand.',
-        'difficulty': 'Beginner'
+    "triangle": {
+        "benefits":   "Stretches legs, hips, and spine. Opens chest. Improves digestion and relieves stress.",
+        "cues":       "Keep both legs straight. Stack shoulders vertically. Look up at raised hand.",
+        "difficulty": "Beginner",
+        "color":      "#06b6d4",
     },
-    'child_pose': {
-        'benefits': 'Gently stretches hips, thighs, and ankles. Calms the mind. Relieves back pain.',
-        'cues': 'Sink hips toward heels. Extend arms forward or alongside body. Breathe deeply.',
-        'difficulty': 'Beginner'
+    "child_pose": {
+        "benefits":   "Gently stretches hips, thighs, and ankles. Calms the mind. Relieves back pain.",
+        "cues":       "Sink hips toward heels. Extend arms forward or alongside body. Breathe deeply.",
+        "difficulty": "Beginner",
+        "color":      "#ec4899",
     },
-    'seated_forward_bend': {
-        'benefits': 'Stretches spine, hamstrings, and shoulders. Calms nervous system. Improves digestion.',
-        'cues': 'Hinge from hips not waist. Keep spine long. Hold feet or shins, not toes.',
-        'difficulty': 'Beginner–Intermediate'
-    }
+    "seated_forward_bend": {
+        "benefits":   "Stretches spine, hamstrings, and shoulders. Calms nervous system. Improves digestion.",
+        "cues":       "Hinge from hips not waist. Keep spine long. Hold feet or shins, not toes.",
+        "difficulty": "Beginner–Intermediate",
+        "color":      "#f97316",
+    },
 }
 
-# ── CSS STYLING ──────────────────────────────────────────────────────────────
-css = """
+# ═══════════════════════════════════════════════════════════════════════════
+# CSS
+# ═══════════════════════════════════════════════════════════════════════════
+
+st.markdown("""
 <style>
-    * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-    }
-    
-    body {
-        background: #0a0a0f;
-        color: #f1f5f9;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-    }
-    
-    .main {
-        background-color: #0a0a0f;
-    }
-    
-    /* Hero Section */
-    .hero {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 3rem 2rem;
-        border-radius: 12px;
-        margin-bottom: 2rem;
-        box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
-    }
-    
-    .hero h1 {
-        font-size: 3rem;
-        font-weight: 700;
-        margin-bottom: 0.5rem;
-        color: white;
-        text-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-    }
-    
-    .hero p {
-        font-size: 1.1rem;
-        color: rgba(255, 255, 255, 0.9);
-        opacity: 95%;
-    }
-    
-    /* Glass Cards */
-    .glass-card {
-        background: rgba(255, 255, 255, 0.04);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 12px;
-        padding: 2rem;
-        margin: 1.5rem 0;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-    }
-    
-    /* Section Headers */
-    .section-header {
-        font-size: 1.5rem;
-        font-weight: 600;
-        color: #f1f5f9;
-        margin: 2rem 0 1rem 0;
-        padding-bottom: 0.5rem;
-        border-bottom: 2px solid;
-        border-image: linear-gradient(90deg, #667eea, #764ba2, #06b6d4) 1;
-    }
-    
-    /* Metric Cards */
-    .metric-card {
-        background: rgba(102, 126, 234, 0.1);
-        border: 1px solid rgba(102, 126, 234, 0.3);
-        border-radius: 8px;
-        padding: 1.5rem;
-        text-align: center;
-        margin: 1rem 0;
-    }
-    
-    .metric-card .metric-label {
-        color: #94a3b8;
-        font-size: 0.85rem;
-        margin-bottom: 0.5rem;
-    }
-    
-    .metric-card .metric-value {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #667eea;
-    }
-    
-    /* Pose Badge */
-    .pose-badge {
-        display: inline-block;
-        background: linear-gradient(135deg, #667eea, #764ba2);
-        color: white;
-        padding: 1rem 2rem;
-        border-radius: 50px;
-        font-weight: 600;
-        font-size: 1.1rem;
-        margin: 1rem 0;
-        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-    }
-    
-    .pose-badge em {
-        color: #06b6d4;
-        font-style: italic;
-        margin: 0 0.5rem;
-    }
-    
-    /* Info Card */
-    .info-card {
-        background: rgba(16, 185, 129, 0.05);
-        border-left: 4px solid #10b981;
-        border-radius: 8px;
-        padding: 1.5rem;
-        margin: 1.5rem 0;
-        line-height: 1.8;
-    }
-    
-    .info-card h4 {
-        color: #10b981;
-        margin-bottom: 1rem;
-        font-size: 1.2rem;
-    }
-    
-    .info-card p {
-        color: #cbd5e1;
-        margin: 0.5rem 0;
-    }
-    
-    .info-card strong {
-        color: #f1f5f9;
-    }
-    
-    .info-card hr {
-        border: none;
-        height: 1px;
-        background: rgba(255, 255, 255, 0.1);
-        margin: 1rem 0;
-    }
-    
-    /* Buttons */
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea, #764ba2) !important;
-        color: white !important;
-        border: none !important;
-        padding: 0.75rem 2rem !important;
-        border-radius: 8px !important;
-        font-weight: 600 !important;
-        font-size: 1rem !important;
-        transition: all 0.3s ease !important;
-        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3) !important;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px) !important;
-        box-shadow: 0 8px 25px rgba(102, 126, 234, 0.5) !important;
-    }
-    
-    /* Success, Warning, Error */
-    .stSuccess {
-        background: rgba(16, 185, 129, 0.1) !important;
-        border: 1px solid #10b981 !important;
-        color: #10b981 !important;
-    }
-    
-    .stWarning {
-        background: rgba(245, 158, 11, 0.1) !important;
-        border: 1px solid #f59e0b !important;
-        color: #fcd34d !important;
-    }
-    
-    .stError {
-        background: rgba(239, 68, 68, 0.1) !important;
-        border: 1px solid #ef4444 !important;
-        color: #fca5a5 !important;
-    }
-    
-    /* Slider */
-    .stSlider {
-        padding: 1rem 0;
-    }
-    
-    /* Dataframe */
-    .stDataFrame {
-        background: rgba(255, 255, 255, 0.02) !important;
-        border: 1px solid rgba(255, 255, 255, 0.08) !important;
-    }
+  body, .main { background: #0a0a0f !important; color: #f1f5f9; }
+
+  .hero {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    border: 1px solid rgba(102,126,234,0.3);
+    padding: 2.5rem 2rem 2rem;
+    border-radius: 16px;
+    margin-bottom: 1.5rem;
+  }
+  .hero h1 { font-size: 2.8rem; font-weight: 700; color: #fff; margin: 0 0 .4rem; }
+  .hero p  { color: #94a3b8; font-size: 1.05rem; margin: 0; }
+  .hero .badge {
+    display: inline-block;
+    background: rgba(102,126,234,.15);
+    border: 1px solid rgba(102,126,234,.4);
+    color: #a5b4fc;
+    padding: .2rem .7rem;
+    border-radius: 20px;
+    font-size: .78rem;
+    margin-right: .4rem;
+    margin-top: .6rem;
+  }
+
+  .status-bar {
+    display: flex; align-items: center; gap: 1rem;
+    background: rgba(16,185,129,.06);
+    border: 1px solid rgba(16,185,129,.25);
+    border-radius: 10px; padding: .75rem 1.25rem;
+    margin-bottom: 1.5rem;
+  }
+  .status-bar.warn {
+    background: rgba(245,158,11,.06);
+    border-color: rgba(245,158,11,.25);
+  }
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #10b981; flex-shrink: 0;
+    box-shadow: 0 0 6px #10b981;
+  }
+  .status-dot.warn { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+  .status-text { color: #e2e8f0; font-size: .9rem; }
+
+  .section-header {
+    font-size: 1.3rem; font-weight: 600; color: #f1f5f9;
+    margin: 1.8rem 0 1rem;
+    padding-bottom: .45rem;
+    border-bottom: 1px solid rgba(255,255,255,.07);
+    letter-spacing: .01em;
+  }
+  .section-header span { color: #667eea; }
+
+  .glass-card {
+    background: rgba(255,255,255,.03);
+    border: 1px solid rgba(255,255,255,.07);
+    border-radius: 12px; padding: 1.5rem;
+    margin: 1rem 0;
+  }
+
+  .metric-row { display: flex; gap: .75rem; flex-wrap: wrap; margin: .75rem 0; }
+  .metric-box {
+    flex: 1; min-width: 110px;
+    background: rgba(102,126,234,.08);
+    border: 1px solid rgba(102,126,234,.2);
+    border-radius: 10px; padding: 1rem;
+    text-align: center;
+  }
+  .metric-box .mval { font-size: 1.6rem; font-weight: 700; color: #a5b4fc; }
+  .metric-box .mlbl { font-size: .78rem; color: #64748b; margin-top: .2rem; }
+
+  /* Prediction result */
+  .pred-card {
+    background: linear-gradient(135deg, rgba(102,126,234,.12), rgba(118,75,162,.08));
+    border: 1px solid rgba(102,126,234,.3);
+    border-radius: 14px; padding: 1.5rem 2rem;
+    margin: 1rem 0;
+  }
+  .pred-title { font-size: 1.5rem; font-weight: 700; color: #fff; margin: 0 0 .25rem; }
+  .pred-sub { color: #06b6d4; font-style: italic; font-size: 1rem; margin: 0; }
+  .conf-bar-wrap {
+    background: rgba(255,255,255,.06); border-radius: 20px;
+    height: 8px; margin: .75rem 0 .25rem; overflow: hidden;
+  }
+  .conf-bar { height: 100%; border-radius: 20px;
+    background: linear-gradient(90deg, #667eea, #06b6d4); }
+  .conf-label { color: #94a3b8; font-size: .82rem; }
+
+  .top3-row {
+    display: flex; align-items: center; gap: .7rem;
+    padding: .4rem 0;
+    border-bottom: 1px solid rgba(255,255,255,.04);
+  }
+  .top3-label { flex: 1; font-size: .85rem; color: #cbd5e1; }
+  .top3-pct { font-size: .85rem; font-weight: 600; color: #a5b4fc;
+    min-width: 42px; text-align: right; }
+  .top3-bar-bg { width: 100px; background: rgba(255,255,255,.06);
+    border-radius: 4px; height: 5px; }
+  .top3-bar { height: 5px; border-radius: 4px; background: #667eea; }
+
+  .info-card {
+    background: rgba(16,185,129,.04);
+    border-left: 3px solid #10b981;
+    border-radius: 0 10px 10px 0;
+    padding: 1.25rem 1.5rem; margin-top: 1rem;
+    line-height: 1.8;
+  }
+  .info-card h4 { color: #10b981; margin: 0 0 .75rem; font-size: 1rem; }
+  .info-card p  { color: #cbd5e1; margin: .3rem 0; font-size: .9rem; }
+  .info-card strong { color: #f1f5f9; }
+  .disclaimer { color: #475569; font-size: .75rem; margin-top: .75rem; }
+
+  .stButton > button {
+    background: linear-gradient(135deg, #667eea, #764ba2) !important;
+    color: #fff !important; border: none !important;
+    padding: .65rem 1.8rem !important; border-radius: 8px !important;
+    font-weight: 600 !important; font-size: .95rem !important;
+    transition: all .25s ease !important;
+    box-shadow: 0 3px 12px rgba(102,126,234,.3) !important;
+  }
+  .stButton > button:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 6px 20px rgba(102,126,234,.5) !important;
+  }
+
+  .aug-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: .5rem; }
+
+  footer { visibility: hidden; }
 </style>
-"""
-
-st.markdown(css, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
+# PYTORCH CLASSES
 # ═══════════════════════════════════════════════════════════════════════════
-
-def process_uploaded_zip(uploaded_file):
-    """
-    Extract ZIP, validate structure, return dataset path.
-    Also resets training state on new upload (refinement #14).
-    """
-    # Clean up old temp directory
-    if st.session_state.temp_dir:
-        shutil.rmtree(st.session_state.temp_dir, ignore_errors=True)
-    
-    # Reset training state on new upload
-    st.session_state.trained = False
-    st.session_state.model = None
-    st.session_state.history = None
-    st.session_state.class_names = []
-    st.session_state.val_loader = None
-    
-    # Create temp directory and extract ZIP
-    tmp_dir = tempfile.mkdtemp()
-    st.session_state.temp_dir = tmp_dir
-    
-    zip_path = os.path.join(tmp_dir, "dataset.zip")
-    with open(zip_path, 'wb') as f:
-        f.write(uploaded_file.read())
-    
-    extract_path = os.path.join(tmp_dir, "extracted")
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_path)
-    except Exception as e:
-        st.error(f"Failed to extract ZIP: {e}")
-        return None
-    
-    # Find root folder containing train/ and val/
-    dataset_root = None
-    for root, dirs, _ in os.walk(extract_path):
-        if 'train' in dirs and 'val' in dirs:
-            dataset_root = root
-            break
-    
-    if dataset_root is None:
-        st.error("Invalid ZIP structure. Must contain `train/` and `val/` folders.")
-        return None
-    
-    return dataset_root
-
 
 class ImageDataset(Dataset):
-    """Custom PyTorch Dataset for loading images from directory structure."""
-    
+    """Loads images from class-named subdirectories."""
+
     def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.images = []
-        self.labels = []
-        self.class_names = []
-        
-        # Get sorted class names (alphabetical)
-        self.class_names = sorted([d for d in os.listdir(root_dir) 
-                                   if os.path.isdir(os.path.join(root_dir, d))])
-        self.class_to_idx = {cls: idx for idx, cls in enumerate(self.class_names)}
-        
-        # Collect all image paths and labels
-        for class_name in self.class_names:
-            class_dir = os.path.join(root_dir, class_name)
-            for img_name in sorted(os.listdir(class_dir)):
-                if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    img_path = os.path.join(class_dir, img_name)
-                    self.images.append(img_path)
-                    self.labels.append(self.class_to_idx[class_name])
-    
+        self.transform   = transform
+        self.images      = []
+        self.labels      = []
+        self.class_names = sorted(
+            d for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        )
+        self.class_to_idx = {c: i for i, c in enumerate(self.class_names)}
+
+        for cls in self.class_names:
+            cls_dir = os.path.join(root_dir, cls)
+            for fname in sorted(os.listdir(cls_dir)):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    self.images.append(os.path.join(cls_dir, fname))
+                    self.labels.append(self.class_to_idx[cls])
+
     def __len__(self):
         return len(self.images)
-    
+
     def __getitem__(self, idx):
-        img_path = self.images[idx]
-        image = Image.open(img_path)
-        # Convert palette images to RGB to prevent transparency warnings
-        if image.mode in ('P', 'PA'):
-            image = image.convert('RGB')
-        elif image.mode != 'RGB':
-            image = image.convert('RGB')
-        label = self.labels[idx]
-        
+        img = Image.open(self.images[idx]).convert("RGB")
         if self.transform:
-            image = self.transform(image)
-        
-        return image, label
-
-
-def create_data_loaders(dataset_path, batch_size=16):
-    """
-    Create training and validation DataLoaders with appropriate transforms.
-    Train: WITH augmentation | Val: WITHOUT augmentation (refinement #5)
-    """
-    # Training transforms WITH augmentation
-    train_transforms = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.RandomRotation(15),
-        transforms.RandomAffine(degrees=0, scale=(0.9, 1.1)),  # Zoom equivalent
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],  # ImageNet stats
-                           std=[0.229, 0.224, 0.225])
-    ])
-    
-    # Validation transforms WITHOUT augmentation
-    val_transforms = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
-    ])
-    
-    # Create datasets
-    train_dataset = ImageDataset(os.path.join(dataset_path, 'train'), 
-                                 transform=train_transforms)
-    val_dataset = ImageDataset(os.path.join(dataset_path, 'val'), 
-                               transform=val_transforms)
-    
-    # Create loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, 
-                             shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, 
-                           shuffle=False, num_workers=0)
-    
-    return train_loader, val_loader, train_dataset.class_names
+            img = self.transform(img)
+        return img, self.labels[idx]
 
 
 class YogaPoseModel(nn.Module):
-    """MobileNetV2 + custom head for yoga pose classification."""
-    
+    """MobileNetV2 backbone + lightweight classification head."""
+
     def __init__(self, num_classes):
-        super(YogaPoseModel, self).__init__()
-        
-        # Load pre-trained MobileNetV2
-        self.base_model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
-        
-        # Freeze all base layers
-        for param in self.base_model.parameters():
-            param.requires_grad = False
-        
-        # Replace classifier with custom head
+        super().__init__()
+        self.base_model = models.mobilenet_v2(
+            weights=models.MobileNet_V2_Weights.DEFAULT
+        )
+        for p in self.base_model.parameters():
+            p.requires_grad = False
+
         in_features = self.base_model.classifier[1].in_features
         self.base_model.classifier = nn.Sequential(
             nn.Linear(in_features, 128),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
+            nn.Linear(128, num_classes),
         )
-    
+
     def forward(self, x):
         return self.base_model(x)
 
 
-def update_progress(epoch, total_epochs, progress_bar, status_text, 
-                   train_loss, train_acc, val_loss, val_acc):
-    """Update Streamlit progress bar and status during training."""
-    progress = (epoch + 1) / total_epochs
-    progress_bar.progress(progress)
-    status_text.markdown(
-        f"**Epoch {epoch+1}/{total_epochs}** — "
-        f"Train Loss: `{train_loss:.4f}` | "
-        f"Train Acc: `{train_acc:.4f}` | "
-        f"Val Acc: `{val_acc:.4f}` | "
-        f"Val Loss: `{val_loss:.4f}`"
-    )
-
-
-def display_dataset_summary(dataset_path):
-    """Display dataset summary: metrics, class distribution, sample images."""
-    train_path = os.path.join(dataset_path, 'train')
-    val_path = os.path.join(dataset_path, 'val')
-    
-    # Count images per class
-    class_counts_train = {}
-    class_counts_val = {}
-    
-    for class_name in os.listdir(train_path):
-        class_dir = os.path.join(train_path, class_name)
-        if os.path.isdir(class_dir):
-            class_counts_train[class_name] = len([f for f in os.listdir(class_dir) 
-                                                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-    
-    for class_name in os.listdir(val_path):
-        class_dir = os.path.join(val_path, class_name)
-        if os.path.isdir(class_dir):
-            class_counts_val[class_name] = len([f for f in os.listdir(class_dir) 
-                                                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-    
-    total_train = sum(class_counts_train.values())
-    total_val = sum(class_counts_val.values())
-    total_images = total_train + total_val
-    
-    # Metric cards
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📚 Total Classes", len(class_counts_train))
-    col2.metric("📷 Total Images", total_images)
-    col3.metric("🏋️ Train", total_train)
-    col4.metric("✅ Validation", total_val)
-    
-    # Class distribution bar chart
-    st.write("**Class Distribution**")
-    class_df = pd.DataFrame({
-        'Class': list(class_counts_train.keys()),
-        'Train': list(class_counts_train.values()),
-        'Val': [class_counts_val.get(c, 0) for c in class_counts_train.keys()]
-    })
-    
-    fig, ax = plt.subplots(figsize=(10, 4))
-    fig.patch.set_facecolor('#0a0a0f')
-    ax.set_facecolor('#111827')
-    
-    class_names = [c.replace('_', ' ').title() for c in class_df['Class']]
-    x = np.arange(len(class_names))
-    width = 0.35
-    
-    ax.barh(x - width/2, class_df['Train'], width, label='Train', color='#667eea')
-    ax.barh(x + width/2, class_df['Val'], width, label='Val', color='#06b6d4')
-    ax.set_yticks(x)
-    ax.set_yticklabels(class_names)
-    ax.set_xlabel('Images', color='#94a3b8')
-    ax.set_title('Images per Class', color='white', fontsize=12, pad=15)
-    ax.legend(facecolor='#1f2937', labelcolor='white')
-    ax.tick_params(colors='#94a3b8')
-    ax.grid(True, axis='x', alpha=0.1)
-    
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
-    
-    # Sample images grid
-    st.write("**Sample Images**")
-    cols = st.columns(4)
-    
-    class_list = list(class_counts_train.keys())
-    for idx, class_name in enumerate(class_list[:8]):
-        col = cols[idx % 4]
-        class_dir = os.path.join(train_path, class_name)
-        images = [f for f in os.listdir(class_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        
-        if images:
-            img_path = os.path.join(class_dir, images[0])
-            img = Image.open(img_path).convert('RGB')
-            col.image(img, caption=class_name.replace('_', '\n').title(), width=200)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# P5 — EVALUATION & GRAD-CAM FUNCTIONS
+# TRANSFORMS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_predictions(model, val_loader):
-    """Run inference on validation set, return predictions, probabilities, and true labels."""
+TRAIN_TRANSFORMS = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomRotation(15),
+    transforms.RandomAffine(degrees=0, scale=(0.9, 1.1)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+VAL_TRANSFORMS = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+PRED_TRANSFORM = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PERSISTENCE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def save_model(model, history, class_names):
+    """Persist model weights, training history, and class order to disk."""
+    torch.save(model.state_dict(), MODEL_PATH)
+    with open(HISTORY_PATH, "w") as f:
+        json.dump(history, f)
+    with open(CLASSES_PATH, "w") as f:
+        json.dump(class_names, f)
+
+
+def load_model_from_disk():
+    """
+    Load saved model + metadata if all three checkpoint files exist.
+    Returns (model, history, class_names) or (None, None, None).
+    """
+    if not (os.path.exists(MODEL_PATH) and
+            os.path.exists(HISTORY_PATH) and
+            os.path.exists(CLASSES_PATH)):
+        return None, None, None
+
+    with open(CLASSES_PATH) as f:
+        class_names = json.load(f)
+    with open(HISTORY_PATH) as f:
+        history = json.load(f)
+
+    model = YogaPoseModel(num_classes=len(class_names)).to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.eval()
-    all_preds = []
-    all_probs = []
-    all_labels = []
+    return model, history, class_names
 
+
+# ── Auto-load on first run ───────────────────────────────────────────────────
+if not st.session_state.trained:
+    _model, _hist, _cls = load_model_from_disk()
+    if _model is not None:
+        st.session_state.model        = _model
+        st.session_state.history      = _hist
+        st.session_state.class_names  = _cls
+        st.session_state.trained      = True
+        st.session_state.model_source = "file"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATASET HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def process_uploaded_zip(uploaded_file):
+    """Extract ZIP, validate train/val structure, return dataset root path."""
+    if st.session_state.temp_dir:
+        shutil.rmtree(st.session_state.temp_dir, ignore_errors=True)
+
+    # Reset training-related state (but NOT the loaded model)
+    st.session_state.val_loader     = None
+    st.session_state.dataset_loaded = False
+
+    tmp_dir  = tempfile.mkdtemp()
+    st.session_state.temp_dir = tmp_dir
+
+    zip_path = os.path.join(tmp_dir, "dataset.zip")
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_file.read())
+
+    extract_path = os.path.join(tmp_dir, "extracted")
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_path)
+    except Exception as e:
+        st.error(f"Failed to extract ZIP: {e}")
+        return None
+
+    dataset_root = None
+    for root, dirs, _ in os.walk(extract_path):
+        if "train" in dirs and "val" in dirs:
+            dataset_root = root
+            break
+
+    if dataset_root is None:
+        st.error("Invalid ZIP structure — must contain `train/` and `val/` folders.")
+        return None
+
+    return dataset_root
+
+
+def create_data_loaders(dataset_path):
+    train_ds = ImageDataset(os.path.join(dataset_path, "train"), TRAIN_TRANSFORMS)
+    val_ds   = ImageDataset(os.path.join(dataset_path, "val"),   VAL_TRANSFORMS)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    return train_loader, val_loader, train_ds.class_names
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EDA HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def count_images(split_path):
+    counts = {}
+    if not os.path.exists(split_path):
+        return counts
+    for cls in sorted(os.listdir(split_path)):
+        d = os.path.join(split_path, cls)
+        if os.path.isdir(d):
+            counts[cls] = len([f for f in os.listdir(d)
+                                if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+    return counts
+
+
+def show_dataset_summary(dataset_path):
+    train_counts = count_images(os.path.join(dataset_path, "train"))
+    val_counts   = count_images(os.path.join(dataset_path, "val"))
+
+    total_train = sum(train_counts.values())
+    total_val   = sum(val_counts.values())
+
+    # ── Metric pills ───────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div class="metric-row">
+      <div class="metric-box"><div class="mval">{len(train_counts)}</div><div class="mlbl">Classes</div></div>
+      <div class="metric-box"><div class="mval">{total_train + total_val}</div><div class="mlbl">Total images</div></div>
+      <div class="metric-box"><div class="mval">{total_train}</div><div class="mlbl">Train</div></div>
+      <div class="metric-box"><div class="mval">{total_val}</div><div class="mlbl">Validation</div></div>
+      <div class="metric-box"><div class="mval">{round(total_train/(total_train+total_val)*100) if (total_train+total_val)>0 else 0}%</div><div class="mlbl">Train ratio</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_chart, col_samples = st.columns([1, 1])
+
+    with col_chart:
+        st.write("**Class distribution**")
+        classes     = list(train_counts.keys())
+        train_vals  = [train_counts[c] for c in classes]
+        val_vals    = [val_counts.get(c, 0) for c in classes]
+        labels      = [c.replace("_", " ").title() for c in classes]
+
+        fig, ax = plt.subplots(figsize=(5, max(3, len(classes) * 0.55)))
+        fig.patch.set_facecolor("#0a0a0f")
+        ax.set_facecolor("#111827")
+        y = np.arange(len(labels))
+        w = 0.38
+        ax.barh(y - w/2, train_vals, w, color="#667eea", label="Train")
+        ax.barh(y + w/2, val_vals,   w, color="#06b6d4", label="Val")
+        ax.set_yticks(y); ax.set_yticklabels(labels)
+        ax.set_xlabel("Images", color="#94a3b8")
+        ax.set_title("Images per class", color="white", fontsize=11, pad=10)
+        ax.legend(facecolor="#1f2937", labelcolor="white", fontsize=9)
+        ax.tick_params(colors="#94a3b8"); ax.grid(axis="x", alpha=0.1)
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+    with col_samples:
+        st.write("**Sample images (one per class)**")
+        train_path = os.path.join(dataset_path, "train")
+        cols       = st.columns(4)
+        for i, cls in enumerate(classes[:8]):
+            cls_dir = os.path.join(train_path, cls)
+            imgs    = sorted(f for f in os.listdir(cls_dir)
+                             if f.lower().endswith((".jpg", ".jpeg", ".png")))
+            if imgs:
+                img = Image.open(os.path.join(cls_dir, imgs[0])).convert("RGB")
+                cols[i % 4].image(img, caption=cls.replace("_", " ").title(),
+                                  use_container_width=True)
+
+
+def show_augmentation_preview(dataset_path):
+    """Show the same image augmented 6 times to demonstrate train transforms."""
+    train_path = os.path.join(dataset_path, "train")
+    classes    = sorted(os.listdir(train_path))
+    if not classes:
+        return
+
+    cls_dir = os.path.join(train_path, classes[0])
+    imgs    = sorted(f for f in os.listdir(cls_dir)
+                     if f.lower().endswith((".jpg", ".jpeg", ".png")))
+    if not imgs:
+        return
+
+    base_img = Image.open(os.path.join(cls_dir, imgs[0])).convert("RGB")
+    st.write(f"**Showing 6 random augmentations of one `{classes[0].replace('_',' ').title()}` image**")
+    st.caption("Each is unique — rotation, flip, zoom, brightness vary randomly. "
+               "Validation images are never augmented.")
+
+    cols = st.columns(6)
+    for col in cols:
+        aug = TRAIN_TRANSFORMS(base_img)
+        # Denormalize for display
+        mean = torch.tensor(IMAGENET_MEAN).view(3,1,1)
+        std  = torch.tensor(IMAGENET_STD).view(3,1,1)
+        disp = torch.clamp(aug * std + mean, 0, 1)
+        disp = (disp.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        col.image(disp, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_training(train_loader, val_loader, class_names,
+                 progress_bar, status_text, epoch_log):
+    num_classes = len(class_names)
+    model       = YogaPoseModel(num_classes).to(DEVICE)
+    criterion   = nn.CrossEntropyLoss()
+    optimizer   = optim.Adam(model.parameters(), lr=LR)
+
+    best_val_loss     = float("inf")
+    patience_counter  = 0
+    best_state        = copy.deepcopy(model.state_dict())   # FIX: deep copy
+    stopped_early_at  = EPOCHS
+
+    history = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
+
+    for epoch in range(EPOCHS):
+        # ── Training phase ─────────────────────────────────────────────────
+        model.train()
+        t_loss, t_correct, t_total = 0.0, 0, 0
+        for images, labels in train_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            out  = model(images)
+            loss = criterion(out, labels)
+            loss.backward()
+            optimizer.step()
+            t_loss    += loss.item()
+            _, pred    = torch.max(out, 1)
+            t_total   += labels.size(0)
+            t_correct += (pred == labels).sum().item()
+
+        t_loss /= len(train_loader)
+        t_acc   = t_correct / t_total
+
+        # ── Validation phase ────────────────────────────────────────────────
+        model.eval()
+        v_loss, v_correct, v_total = 0.0, 0, 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                out   = model(images)
+                loss  = criterion(out, labels)
+                v_loss    += loss.item()
+                _, pred    = torch.max(out, 1)
+                v_total   += labels.size(0)
+                v_correct += (pred == labels).sum().item()
+
+        v_loss /= len(val_loader)
+        v_acc   = v_correct / v_total
+
+        history["loss"].append(round(t_loss, 5))
+        history["accuracy"].append(round(t_acc, 5))
+        history["val_loss"].append(round(v_loss, 5))
+        history["val_accuracy"].append(round(v_acc, 5))
+
+        progress_bar.progress((epoch + 1) / EPOCHS)
+        status_text.markdown(
+            f"**Epoch {epoch+1}/{EPOCHS}** — "
+            f"Train Acc: `{t_acc:.4f}` | Val Acc: `{v_acc:.4f}` | Val Loss: `{v_loss:.4f}`"
+        )
+        epoch_log.append(
+            {"epoch": epoch + 1, "train_acc": round(t_acc, 4),
+             "val_acc": round(v_acc, 4), "val_loss": round(v_loss, 4)}
+        )
+
+        # ── Early stopping ──────────────────────────────────────────────────
+        if v_loss < best_val_loss:
+            best_val_loss    = v_loss
+            patience_counter = 0
+            best_state       = copy.deepcopy(model.state_dict())   # FIX: deep copy
+        else:
+            patience_counter += 1
+
+        if patience_counter >= PATIENCE:
+            stopped_early_at = epoch + 1
+            break
+
+    model.load_state_dict(best_state)
+    model.eval()
+    return model, history, stopped_early_at
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EVALUATION HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(show_spinner=False)
+def _get_predictions_cached(_model_id, _val_loader_id):
+    """
+    Cache predictions so confusion matrix / report / ROC don't each
+    run a full forward pass.  _model_id / _val_loader_id are just
+    hashable keys (id of the objects); real objects are in session state.
+    """
+    model      = st.session_state.model
+    val_loader = st.session_state.val_loader
+    model.eval()
+    preds, probs, labels = [], [], []
     with torch.no_grad():
-        for images, labels in val_loader:
-            images = images.to(DEVICE)
-            outputs = model(images)
-            probs = torch.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-            all_labels.extend(labels.numpy())
-
-    return np.array(all_preds), np.array(all_probs), np.array(all_labels)
+        for imgs, lbls in val_loader:
+            out  = model(imgs.to(DEVICE))
+            p    = torch.softmax(out, 1)
+            _, q = torch.max(out, 1)
+            preds.extend(q.cpu().numpy())
+            probs.extend(p.cpu().numpy())
+            labels.extend(lbls.numpy())
+    return np.array(preds), np.array(probs), np.array(labels)
 
 
-def plot_confusion_matrix(model, val_loader, class_names):
-    """Generate confusion matrix heatmap with dark theme."""
-    y_pred, _, y_true = get_predictions(model, val_loader)
+def plot_learning_curves(history):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#111827"); fig.patch.set_facecolor("#0a0a0f")
 
-    cm = confusion_matrix(y_true, y_pred)
-    labels = [c.replace('_', ' ').title() for c in class_names]
+    ep = range(1, len(history["accuracy"]) + 1)
+    ax1.plot(ep, history["accuracy"],     color="#667eea", lw=2.5, label="Train")
+    ax1.plot(ep, history["val_accuracy"], color="#06b6d4", lw=2.5, ls="--", label="Val")
+    ax1.set_title("Accuracy", color="white", fontsize=12)
+    ax1.set_xlabel("Epoch", color="#94a3b8"); ax1.set_ylabel("Accuracy", color="#94a3b8")
+    ax1.legend(facecolor="#1f2937", labelcolor="white"); ax1.tick_params(colors="#94a3b8")
+    ax1.grid(alpha=0.1); ax1.set_xticks(list(ep))
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    fig.patch.set_facecolor('#0a0a0f')
-    ax.set_facecolor('#111827')
+    ax2.plot(ep, history["loss"],     color="#667eea", lw=2.5, label="Train")
+    ax2.plot(ep, history["val_loss"], color="#f59e0b", lw=2.5, ls="--", label="Val")
+    ax2.set_title("Loss", color="white", fontsize=12)
+    ax2.set_xlabel("Epoch", color="#94a3b8"); ax2.set_ylabel("Loss", color="#94a3b8")
+    ax2.legend(facecolor="#1f2937", labelcolor="white"); ax2.tick_params(colors="#94a3b8")
+    ax2.grid(alpha=0.1); ax2.set_xticks(list(ep))
 
-    sns.heatmap(
-        cm, annot=True, fmt='d', cmap='Blues',
-        xticklabels=labels, yticklabels=labels,
-        ax=ax, linewidths=0.5, linecolor='#1f2937'
-    )
+    plt.tight_layout()
+    st.pyplot(fig); plt.close()
 
-    ax.set_title('Confusion Matrix \u2014 Validation Set',
-                 color='white', fontsize=14, pad=20)
-    ax.set_xlabel('Predicted Label', color='#94a3b8', labelpad=10)
-    ax.set_ylabel('True Label', color='#94a3b8', labelpad=10)
 
-    plt.xticks(rotation=45, ha='right', color='#94a3b8')
-    plt.yticks(rotation=0, color='#94a3b8')
+def plot_confusion_matrix_fig(y_pred, y_true, class_names):
+    cm     = confusion_matrix(y_true, y_pred)
+    labels = [c.replace("_", " ").title() for c in class_names]
 
+    fig, ax = plt.subplots(figsize=(9, 7))
+    fig.patch.set_facecolor("#0a0a0f"); ax.set_facecolor("#111827")
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=labels, yticklabels=labels, ax=ax,
+                linewidths=0.4, linecolor="#1f2937")
+    ax.set_title("Confusion Matrix — Validation Set", color="white", fontsize=13, pad=16)
+    ax.set_xlabel("Predicted", color="#94a3b8", labelpad=8)
+    ax.set_ylabel("True",      color="#94a3b8", labelpad=8)
+    plt.xticks(rotation=45, ha="right", color="#94a3b8")
+    plt.yticks(rotation=0,  color="#94a3b8")
     plt.tight_layout()
     return fig
 
 
-def display_classification_report(model, val_loader, class_names):
-    """Display classification report as styled DataFrame."""
-    y_pred, _, y_true = get_predictions(model, val_loader)
+def plot_per_class_accuracy(y_pred, y_true, class_names):
+    labels = [c.replace("_", " ").title() for c in class_names]
+    accs   = []
+    for i in range(len(class_names)):
+        mask = y_true == i
+        acc  = (y_pred[mask] == i).sum() / mask.sum() if mask.sum() > 0 else 0
+        accs.append(round(float(acc), 3))
 
-    labels = [c.replace('_', ' ').title() for c in class_names]
-    report_dict = classification_report(
-        y_true, y_pred,
-        target_names=labels,
-        output_dict=True
-    )
+    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.55)))
+    fig.patch.set_facecolor("#0a0a0f"); ax.set_facecolor("#111827")
+    colors = ["#10b981" if a >= 0.8 else "#f59e0b" if a >= 0.6 else "#ef4444"
+              for a in accs]
+    y = range(len(labels))
+    ax.barh(list(y), accs, color=colors)
+    ax.set_yticks(list(y)); ax.set_yticklabels(labels)
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("Accuracy", color="#94a3b8")
+    ax.set_title("Per-class accuracy (green ≥ 0.8, orange ≥ 0.6, red < 0.6)",
+                 color="white", fontsize=10, pad=10)
+    ax.tick_params(colors="#94a3b8"); ax.grid(axis="x", alpha=0.1)
+    for i, a in enumerate(accs):
+        ax.text(a + 0.01, i, f"{a:.0%}", va="center", color="#94a3b8", fontsize=9)
+    plt.tight_layout()
+    return fig
 
-    df = pd.DataFrame(report_dict).transpose()
-    df = df.drop(['accuracy'], errors='ignore')
-    df = df.round(3)
 
+def show_classification_report(y_pred, y_true, class_names):
+    labels  = [c.replace("_", " ").title() for c in class_names]
+    report  = classification_report(y_true, y_pred,
+                                    target_names=labels, output_dict=True)
+    df = pd.DataFrame(report).T.drop("accuracy", errors="ignore").round(3)
     st.dataframe(
         df.style
-          .background_gradient(
-              cmap='Blues',
-              subset=['precision', 'recall', 'f1-score'])
-          .format({
-              'precision': '{:.3f}',
-              'recall': '{:.3f}',
-              'f1-score': '{:.3f}',
-              'support': '{:.0f}'
-          }),
-        use_container_width=True
+          .background_gradient(cmap="Blues", subset=["precision", "recall", "f1-score"])
+          .format({"precision": "{:.3f}", "recall": "{:.3f}",
+                   "f1-score": "{:.3f}", "support": "{:.0f}"}),
+        use_container_width=True,
     )
 
 
-def plot_roc_curves(model, val_loader, class_names):
-    """Generate ROC curves (One-vs-Rest) with AUC scores."""
-    _, y_pred_probs, y_true = get_predictions(model, val_loader)
-    num_classes = len(class_names)
+def plot_roc_curves(y_probs, y_true, class_names):
+    n     = len(class_names)
+    y_bin = label_binarize(y_true, classes=list(range(n)))
 
-    y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+    fig, ax = plt.subplots(figsize=(9, 7))
+    fig.patch.set_facecolor("#0a0a0f"); ax.set_facecolor("#111827")
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    fig.patch.set_facecolor('#0a0a0f')
-    ax.set_facecolor('#111827')
-
-    palette = ['#667eea', '#764ba2', '#06b6d4', '#10b981',
-               '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899']
+    palette = ["#667eea", "#764ba2", "#06b6d4", "#10b981",
+               "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899"]
 
     for i, (name, color) in enumerate(zip(class_names, palette)):
-        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred_probs[:, i])
-        roc_auc = auc(fpr, tpr)
-        label = f"{name.replace('_', ' ').title()} (AUC = {roc_auc:.2f})"
-        ax.plot(fpr, tpr, color=color, linewidth=2, label=label)
+        fpr, tpr, _ = roc_curve(y_bin[:, i], y_probs[:, i])
+        roc_auc     = auc(fpr, tpr)
+        ax.plot(fpr, tpr, color=color, lw=2,
+                label=f"{name.replace('_',' ').title()} (AUC={roc_auc:.2f})")
 
-    ax.plot([0, 1], [0, 1], 'white', linestyle='--', alpha=0.3, linewidth=1)
-    ax.set_xlabel('False Positive Rate', color='#94a3b8')
-    ax.set_ylabel('True Positive Rate', color='#94a3b8')
-    ax.set_title('ROC Curves \u2014 One-vs-Rest', color='white', fontsize=14)
-    ax.legend(loc='lower right', fontsize=8,
-              facecolor='#1f2937', labelcolor='white', framealpha=0.8)
-    ax.tick_params(colors='#94a3b8')
-    ax.grid(True, alpha=0.1)
-
+    ax.plot([0,1],[0,1], "white", ls="--", alpha=0.25, lw=1)
+    ax.set_xlabel("False Positive Rate", color="#94a3b8")
+    ax.set_ylabel("True Positive Rate",  color="#94a3b8")
+    ax.set_title("ROC Curves — One-vs-Rest", color="white", fontsize=13)
+    ax.legend(loc="lower right", fontsize=8,
+              facecolor="#1f2937", labelcolor="white", framealpha=0.8)
+    ax.tick_params(colors="#94a3b8"); ax.grid(alpha=0.08)
     plt.tight_layout()
     return fig
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# GRAD-CAM
+# ═══════════════════════════════════════════════════════════════════════════
+
 def get_last_conv_layer(model):
-    """Find the last Conv2d layer in MobileNetV2 features backbone."""
     last_conv = None
     for module in model.base_model.features.modules():
         if isinstance(module, nn.Conv2d):
             last_conv = module
     if last_conv is None:
-        raise ValueError("No Conv2d layer found in model.")
+        raise ValueError("No Conv2d layer found in model backbone.")
     return last_conv
 
 
 def generate_gradcam(model, img_tensor, class_idx):
-    """
-    Generate Grad-CAM heatmap and overlay using PyTorch hooks.
-    Returns (heatmap_colored, overlay) as numpy uint8 arrays.
-    """
+    """Return (heatmap_rgb, overlay_rgb) as uint8 numpy arrays."""
     model.eval()
-
-    activations = []
-    gradients = []
+    activations, gradients = [], []
 
     target_layer = get_last_conv_layer(model)
 
-    # Hooks to capture activations and gradients
-    def forward_hook(module, input, output):
-        activations.append(output.detach())
+    fwd = target_layer.register_forward_hook(
+        lambda m, i, o: activations.append(o.detach()))
+    bwd = target_layer.register_full_backward_hook(
+        lambda m, gi, go: gradients.append(go[0].detach()))
 
-    def backward_hook(module, grad_input, grad_output):
-        gradients.append(grad_output[0].detach())
-
-    fwd_handle = target_layer.register_forward_hook(forward_hook)
-    bwd_handle = target_layer.register_full_backward_hook(backward_hook)
-
-    # Forward pass — need requires_grad on input so gradients flow through frozen layers
-    img_input = img_tensor.clone().requires_grad_(True)
-    output = model(img_input)
-
-    # Backward pass for target class
+    inp  = img_tensor.clone().requires_grad_(True)
+    out  = model(inp)
     model.zero_grad()
-    target_score = output[0, class_idx]
-    target_score.backward()
+    out[0, class_idx].backward()
 
-    # Remove hooks
-    fwd_handle.remove()
-    bwd_handle.remove()
+    fwd.remove(); bwd.remove()
 
-    # Compute Grad-CAM
-    activation = activations[0][0]  # (C, H, W)
-    gradient = gradients[0][0]      # (C, H, W)
+    act  = activations[0][0]          # (C, H, W)
+    grad = gradients[0][0]            # (C, H, W)
 
-    # Pool gradients across spatial dimensions
-    pooled_grads = torch.mean(gradient, dim=(1, 2))  # (C,)
+    weights = torch.mean(grad, dim=(1, 2))  # (C,)
+    cam     = torch.zeros(act.shape[1:])
+    for i, w in enumerate(weights):
+        cam += w * act[i]
 
-    # Weight each feature map by its gradient importance
-    for i in range(activation.shape[0]):
-        activation[i] *= pooled_grads[i]
+    cam = torch.relu(cam)
+    cam = cam / (cam.max() + 1e-8)    # FIX: +1e-8 guard
+    cam = cam.cpu().numpy()
 
-    heatmap = torch.mean(activation, dim=0)  # (H, W)
-    heatmap = torch.relu(heatmap)  # ReLU — retain only positive influence
-    heatmap = heatmap / (torch.max(heatmap) + 1e-8)  # Normalize (refinement #13)
-    heatmap = heatmap.cpu().numpy()
+    cam_resized  = cv2.resize(cam, (IMG_SIZE, IMG_SIZE))
+    heatmap_u8   = np.uint8(255 * cam_resized)
+    heatmap_bgr  = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
+    heatmap_rgb  = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
 
-    # Resize to image dimensions
-    heatmap_resized = cv2.resize(heatmap, (128, 128))
+    # Denormalize original for blending
+    mean   = torch.tensor(IMAGENET_MEAN).view(3,1,1)
+    std    = torch.tensor(IMAGENET_STD).view(3,1,1)
+    orig   = torch.clamp(img_tensor[0].cpu() * std + mean, 0, 1)
+    orig   = (orig.permute(1,2,0).numpy() * 255).astype(np.uint8)
 
-    # Apply JET colormap: blue=low importance, red=high importance
-    heatmap_colored = np.uint8(255 * heatmap_resized)
-    heatmap_colored = cv2.applyColorMap(heatmap_colored, cv2.COLORMAP_JET)
-    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-
-    # Denormalize original image (undo ImageNet normalization)
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    img_denorm = img_tensor[0].cpu() * std + mean
-    img_denorm = torch.clamp(img_denorm, 0, 1)
-    original = np.uint8(img_denorm.permute(1, 2, 0).numpy() * 255)
-
-    # Blend heatmap with original image
-    overlay = cv2.addWeighted(original, 0.6, heatmap_colored, 0.4, 0)
-
-    return heatmap_colored, overlay
+    overlay = cv2.addWeighted(orig, 0.6, heatmap_rgb, 0.4, 0)
+    return heatmap_rgb, overlay
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PAGE SECTIONS
+# PREDICTION HELPER
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Hero Header
+def predict_image(uploaded_img):
+    """
+    Run full prediction pipeline on an uploaded image file.
+    Returns dict with class, confidence, top3, heatmap, overlay, img_resized.
+    """
+    model       = st.session_state.model
+    class_names = st.session_state.class_names
+
+    img         = Image.open(uploaded_img).convert("RGB")
+    img_resized = img.resize((IMG_SIZE, IMG_SIZE))
+    img_tensor  = PRED_TRANSFORM(img).unsqueeze(0).to(DEVICE)
+
+    model.eval()
+    with torch.no_grad():
+        out   = model(img_tensor)
+        probs = torch.softmax(out, 1)[0].cpu().numpy()
+
+    top3_idx    = np.argsort(probs)[::-1][:3]
+    class_idx   = int(top3_idx[0])
+    confidence  = float(probs[class_idx])
+
+    heatmap, overlay = generate_gradcam(model, img_tensor, class_idx)
+
+    return {
+        "class_key":    class_names[class_idx],
+        "display_name": class_names[class_idx].replace("_", " ").title(),
+        "sanskrit":     sanskrit_names.get(class_names[class_idx], ""),
+        "confidence":   confidence,
+        "top3":         [(class_names[i].replace("_"," ").title(),
+                          float(probs[i])) for i in top3_idx],
+        "all_probs":    probs,
+        "heatmap":      heatmap,
+        "overlay":      overlay,
+        "img_resized":  img_resized,
+        "class_names":  class_names,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ── UI ──────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Hero ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="hero">
-    <h1>🧘 AsanaAI</h1>
-    <p>Explainable Deep Learning System for Yoga Pose Recognition</p>
+  <h1>🧘 AsanaAI</h1>
+  <p>Explainable Deep Learning · Transfer Learning · Grad-CAM Visualisation</p>
+  <span class="badge">MobileNetV2</span>
+  <span class="badge">PyTorch</span>
+  <span class="badge">Grad-CAM</span>
+  <span class="badge">CELBC608 — DSL Sem VI</span>
 </div>
 """, unsafe_allow_html=True)
 
-# GPU Warning if not available
 if not GPU_AVAILABLE:
-    st.warning(
-        "⚠️ **GPU not detected** — Using CPU mode. Training will be slower. "
-        "For GPU support, ensure CUDA/cuDNN are properly installed."
-    )
+    st.warning("⚠️ GPU not detected — running on CPU. Training will be slower.")
 
-st.markdown("---")
-
-# ── SECTION 1: DATASET UPLOAD ────────────────────────────────────────────────
-st.markdown('<h2 class="section-header">📁 Upload Dataset</h2>', 
-            unsafe_allow_html=True)
-
-uploaded_file = st.file_uploader(
-    "Upload yoga_dataset.zip",
-    type=['zip'],
-    help="Must contain yoga_dataset/train/ and yoga_dataset/val/ folders"
-)
-
-if uploaded_file:
-    with st.spinner("Processing ZIP file..."):
-        dataset_path = process_uploaded_zip(uploaded_file)
-        
-        if dataset_path:
-            st.session_state.dataset_path = dataset_path
-            st.session_state.dataset_loaded = True
-            st.success("✅ Dataset loaded successfully!")
-        else:
-            st.session_state.dataset_loaded = False
-
-st.markdown("---")
-
-# ── SECTION 2: DATASET SUMMARY ───────────────────────────────────────────────
-if st.session_state.dataset_loaded:
-    st.markdown('<h2 class="section-header">📊 Dataset Summary</h2>', 
-                unsafe_allow_html=True)
-    display_dataset_summary(st.session_state.dataset_path)
-    st.markdown("---")
-
-# ── SECTION 3: MODEL TRAINING ────────────────────────────────────────────────
-if st.session_state.dataset_loaded and not st.session_state.trained:
-    st.markdown('<h2 class="section-header">🚀 Model Training</h2>', 
-                unsafe_allow_html=True)
-    
-    if st.button("🚀 Begin Training", type="primary", use_container_width=True):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        with st.spinner("Training model..."):
-            # Create data loaders
-            train_loader, val_loader, class_names = create_data_loaders(
-                st.session_state.dataset_path, 
-                batch_size=16
-            )
-            num_classes = len(class_names)
-            
-            # Build model and move to device
-            model = YogaPoseModel(num_classes).to(DEVICE)
-            
-            # Loss and optimizer
-            criterion = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
-            
-            EPOCHS = 10
-            patience = 3
-            best_val_loss = float('inf')
-            patience_counter = 0
-            
-            # History tracking
-            history = {
-                'loss': [],
-                'accuracy': [],
-                'val_loss': [],
-                'val_accuracy': []
-            }
-            
-            # Training loop
-            for epoch in range(EPOCHS):
-                # Training phase
-                model.train()
-                train_loss = 0.0
-                train_correct = 0
-                train_total = 0
-                
-                for batch_idx, (images, labels) in enumerate(train_loader):
-                    images, labels = images.to(DEVICE), labels.to(DEVICE)
-                    
-                    # Forward pass
-                    optimizer.zero_grad()
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                    
-                    # Backward pass
-                    loss.backward()
-                    optimizer.step()
-                    
-                    # Track metrics
-                    train_loss += loss.item()
-                    _, predicted = torch.max(outputs.data, 1)
-                    train_total += labels.size(0)
-                    train_correct += (predicted == labels).sum().item()
-                
-                train_loss /= len(train_loader)
-                train_acc = train_correct / train_total
-                
-                # Validation phase
-                model.eval()
-                val_loss = 0.0
-                val_correct = 0
-                val_total = 0
-                
-                with torch.no_grad():
-                    for images, labels in val_loader:
-                        images, labels = images.to(DEVICE), labels.to(DEVICE)
-                        
-                        outputs = model(images)
-                        loss = criterion(outputs, labels)
-                        
-                        val_loss += loss.item()
-                        _, predicted = torch.max(outputs.data, 1)
-                        val_total += labels.size(0)
-                        val_correct += (predicted == labels).sum().item()
-                
-                val_loss /= len(val_loader)
-                val_acc = val_correct / val_total
-                
-                # Store history
-                history['loss'].append(train_loss)
-                history['accuracy'].append(train_acc)
-                history['val_loss'].append(val_loss)
-                history['val_accuracy'].append(val_acc)
-                
-                # Update progress
-                update_progress(epoch, EPOCHS, progress_bar, status_text, 
-                               train_loss, train_acc, val_loss, val_acc)
-                
-                # Early stopping
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                    best_model_state = model.state_dict().copy()
-                else:
-                    patience_counter += 1
-                
-                if patience_counter >= patience:
-                    # Restore best weights
-                    model.load_state_dict(best_model_state)
-                    break
-            
-            # Persist to session state
-            st.session_state.model = model
-            st.session_state.trained = True
-            st.session_state.history = history
-            st.session_state.class_names = class_names
-            st.session_state.val_loader = val_loader
-            
-            st.success("✅ Training complete!")
-
-elif st.session_state.trained:
-    st.info("✅ Model trained. Scroll down for results.")
-    st.markdown("---")
-
-# ── SECTION 4: TRAINING RESULTS ──────────────────────────────────────────────
-if st.session_state.trained and st.session_state.history:
-    st.markdown('<h2 class="section-header">📈 Training Results</h2>', 
-                unsafe_allow_html=True)
-    
-    history = st.session_state.history
-    
-    # Metric cards
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("🎯 Train Accuracy", f"{history['accuracy'][-1]:.2%}")
-    col2.metric("✅ Val Accuracy", f"{history['val_accuracy'][-1]:.2%}")
-    col3.metric("📉 Train Loss", f"{history['loss'][-1]:.4f}")
-    col4.metric("📊 Val Loss", f"{history['val_loss'][-1]:.4f}")
-    
-    # Learning curves
-    col_acc, col_loss = st.columns(2)
-    
-    with col_acc:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        fig.patch.set_facecolor('#0a0a0f')
-        ax.set_facecolor('#111827')
-        
-        ax.plot(history['accuracy'], label='Train Accuracy', 
-               color='#667eea', linewidth=2.5)
-        ax.plot(history['val_accuracy'], label='Val Accuracy', 
-               color='#06b6d4', linewidth=2.5, linestyle='--')
-        
-        ax.set_xlabel('Epoch', color='#94a3b8')
-        ax.set_ylabel('Accuracy', color='#94a3b8')
-        ax.set_title('Model Accuracy', color='white', fontsize=12)
-        ax.legend(facecolor='#1f2937', labelcolor='white')
-        ax.tick_params(colors='#94a3b8')
-        ax.grid(True, alpha=0.1)
-        
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-    
-    with col_loss:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        fig.patch.set_facecolor('#0a0a0f')
-        ax.set_facecolor('#111827')
-        
-        ax.plot(history['loss'], label='Train Loss', 
-               color='#667eea', linewidth=2.5)
-        ax.plot(history['val_loss'], label='Val Loss', 
-               color='#f59e0b', linewidth=2.5, linestyle='--')
-        
-        ax.set_xlabel('Epoch', color='#94a3b8')
-        ax.set_ylabel('Loss', color='#94a3b8')
-        ax.set_title('Model Loss', color='white', fontsize=12)
-        ax.legend(facecolor='#1f2937', labelcolor='white')
-        ax.tick_params(colors='#94a3b8')
-        ax.grid(True, alpha=0.1)
-        
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-    
-    st.markdown("---")
-
-# ── SECTION 5: MODEL EVALUATION ──────────────────────────────────────────────
-if st.session_state.trained and st.session_state.val_loader is not None:
-    st.markdown('<h2 class="section-header">📊 Model Evaluation</h2>',
-                unsafe_allow_html=True)
-
-    _eval_model = st.session_state.model
-    _eval_val_loader = st.session_state.val_loader
-    _eval_class_names = st.session_state.class_names
-
-    # ── Confusion Matrix ──
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.write("**Confusion Matrix**")
-    fig_cm = plot_confusion_matrix(_eval_model, _eval_val_loader, _eval_class_names)
-    st.pyplot(fig_cm)
-    plt.close()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ── Classification Report ──
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.write("**Classification Report**")
-    display_classification_report(_eval_model, _eval_val_loader, _eval_class_names)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ── ROC Curves ──
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.write("**ROC Curves (One-vs-Rest)**")
-    fig_roc = plot_roc_curves(_eval_model, _eval_val_loader, _eval_class_names)
-    st.pyplot(fig_roc)
-    plt.close()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-# ── SECTION 6: PREDICTION + GRAD-CAM ─────────────────────────────────────────
+# ── Status bar ───────────────────────────────────────────────────────────────
 if st.session_state.trained:
-    st.markdown('<h2 class="section-header">🔮 Pose Prediction & Grad-CAM</h2>',
+    src = st.session_state.model_source
+    src_txt = "loaded from saved checkpoint" if src == "file" else "trained this session"
+    n_cls = len(st.session_state.class_names)
+    st.markdown(f"""
+    <div class="status-bar">
+      <div class="status-dot"></div>
+      <div class="status-text">
+        ✅ Model ready — {n_cls} classes, {src_txt}.
+        Scroll down to <strong>Predict a Pose</strong> or review evaluation metrics.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <div class="status-bar warn">
+      <div class="status-dot warn"></div>
+      <div class="status-text">
+        ⚠️ No trained model found. Upload your dataset ZIP and click <strong>Begin Training</strong>.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1 — PREDICT A POSE  (shown at top when model is ready)
+# ═══════════════════════════════════════════════════════════════════════════
+
+if st.session_state.trained:
+    st.markdown('<div class="section-header">🔮 <span>Predict a Pose</span></div>',
                 unsafe_allow_html=True)
 
-    pred_image = st.file_uploader(
-        "Upload a yoga pose image to classify",
-        type=['jpg', 'jpeg', 'png'],
-        key='prediction_upload'
+    st.markdown(
+        "Upload any yoga pose image — the model will classify it, show confidence, "
+        "and highlight the body regions that drove the decision using **Grad-CAM**.",
+        unsafe_allow_html=False,
     )
 
-    if pred_image:
-        _pred_model = st.session_state.model
-        _pred_class_names = st.session_state.class_names
+    pred_file = st.file_uploader(
+        "Upload yoga pose image (JPG / PNG)",
+        type=["jpg", "jpeg", "png"],
+        key="pred_upload",
+    )
 
-        # Load and prepare image
-        img = Image.open(pred_image).convert('RGB')
-        img_resized = img.resize((128, 128))
+    if pred_file is not None:
+        with st.spinner("Classifying…"):
+            result = predict_image(pred_file)
 
-        # Prepare tensor with validation transforms
-        pred_transform = transforms.Compose([
-            transforms.Resize((128, 128)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
-        ])
-        img_tensor = pred_transform(img).unsqueeze(0).to(DEVICE)
+        cls_key   = result["class_key"]
+        disp      = result["display_name"]
+        sanskrit  = result["sanskrit"]
+        conf      = result["confidence"]
+        accent    = pose_info.get(cls_key, {}).get("color", "#667eea")
 
-        # Predict
-        _pred_model.eval()
-        with torch.no_grad():
-            outputs = _pred_model(img_tensor)
-            probs = torch.softmax(outputs, dim=1)
-
-        class_idx = int(torch.argmax(probs[0]).item())
-        confidence = float(probs[0][class_idx].item())
-        predicted_class = _pred_class_names[class_idx]
-        display_name = predicted_class.replace('_', ' ').title()
-        sanskrit = sanskrit_names.get(predicted_class, '')
-
-        # Generate Grad-CAM
-        heatmap, overlay = generate_gradcam(_pred_model, img_tensor, class_idx)
-
-        # Prediction badge
+        # ── Prediction card ─────────────────────────────────────────────────
+        conf_pct = round(conf * 100, 1)
         st.markdown(f"""
-        <div class="pose-badge">
-            🧘 {display_name} &nbsp;|&nbsp;
-            <em>{sanskrit}</em> &nbsp;|&nbsp;
-            Confidence: {confidence:.1%}
+        <div class="pred-card">
+          <p class="pred-title">{disp}</p>
+          <p class="pred-sub">{sanskrit}</p>
+          <div class="conf-bar-wrap">
+            <div class="conf-bar" style="width:{conf_pct}%;
+              background:linear-gradient(90deg,{accent},{accent}aa)"></div>
+          </div>
+          <p class="conf-label">Confidence: <strong style="color:{accent}">{conf_pct}%</strong></p>
         </div>
         """, unsafe_allow_html=True)
 
-        # Three-column image display
+        # ── Images ──────────────────────────────────────────────────────────
         c1, c2, c3 = st.columns(3)
-        c1.image(img_resized,   caption="📷 Original",          use_container_width=True)
-        c2.image(heatmap,       caption="🔥 Grad-CAM Heatmap",  use_container_width=True)
-        c3.image(overlay,       caption="🔍 Overlay",           use_container_width=True)
+        c1.image(result["img_resized"], caption="📷 Original",         use_container_width=True)
+        c2.image(result["heatmap"],     caption="🔥 Grad-CAM Heatmap",  use_container_width=True)
+        c3.image(result["overlay"],     caption="🔍 Overlay",           use_container_width=True)
 
-        # Probability bar chart
-        predictions_np = probs[0].cpu().numpy()
-        prob_df = pd.DataFrame({
-            'Pose': [c.replace('_', ' ').title() for c in _pred_class_names],
-            'Confidence': predictions_np
-        }).sort_values('Confidence', ascending=True)
+        st.caption(
+            "Grad-CAM: red = strongest influence on prediction, blue = weakest. "
+            "Good predictions highlight relevant body regions (limbs, torso alignment)."
+        )
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        fig.patch.set_facecolor('#0a0a0f')
-        ax.set_facecolor('#111827')
-        bar_colors = [
-            '#10b981' if p == display_name else '#667eea'
-            for p in prob_df['Pose']
-        ]
-        ax.barh(prob_df['Pose'], prob_df['Confidence'],
-                color=bar_colors, edgecolor='none')
-        ax.set_xlabel('Confidence', color='#94a3b8')
-        ax.set_title('Class Probability Distribution',
-                     color='white', fontsize=12)
-        ax.tick_params(colors='#94a3b8')
-        ax.grid(True, axis='x', alpha=0.15)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
+        # ── Top-3 + full probability bar chart ──────────────────────────────
+        col_t3, col_bar = st.columns([1, 2])
 
-        # Pose info card
-        info = pose_info.get(predicted_class, {})
+        with col_t3:
+            st.write("**Top-3 predictions**")
+            for label, prob in result["top3"]:
+                bar_w = round(prob * 100)
+                color = accent if label == disp else "#667eea"
+                st.markdown(f"""
+                <div class="top3-row">
+                  <span class="top3-label">{label}</span>
+                  <div class="top3-bar-bg">
+                    <div class="top3-bar" style="width:{bar_w}%;background:{color}"></div>
+                  </div>
+                  <span class="top3-pct">{bar_w}%</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+        with col_bar:
+            st.write("**All class probabilities**")
+            all_p   = result["all_probs"]
+            cnames  = result["class_names"]
+            prob_df = pd.DataFrame({
+                "Pose":       [c.replace("_"," ").title() for c in cnames],
+                "Confidence": all_p,
+            }).sort_values("Confidence", ascending=True)
+
+            fig, ax = plt.subplots(figsize=(6, max(3, len(cnames)*0.55)))
+            fig.patch.set_facecolor("#0a0a0f"); ax.set_facecolor("#111827")
+            bar_colors = [accent if p == disp else "#334155"
+                          for p in prob_df["Pose"]]
+            ax.barh(prob_df["Pose"], prob_df["Confidence"],
+                    color=bar_colors, edgecolor="none")
+            ax.set_xlim(0, 1)
+            ax.set_xlabel("Confidence", color="#94a3b8")
+            ax.tick_params(colors="#94a3b8"); ax.grid(axis="x", alpha=0.1)
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        # ── Pose info card ───────────────────────────────────────────────────
+        info = pose_info.get(cls_key, {})
         if info:
             st.markdown(f"""
             <div class="info-card">
-                <h4>📋 {display_name} ({sanskrit})</h4>
-                <p><strong>Benefits:</strong> {info['benefits']}</p>
-                <p><strong>Form Cues:</strong> {info['cues']}</p>
-                <p><strong>Difficulty:</strong> {info['difficulty']}</p>
-                <hr style="opacity:0.2">
-                <p style="opacity:0.5; font-size:0.75em;">
-                ⚠️ This tool supports beginner practitioners.
+              <h4>📋 {disp} — {sanskrit}</h4>
+              <p><strong>Benefits:</strong> {info['benefits']}</p>
+              <p><strong>Form cues:</strong> {info['cues']}</p>
+              <p><strong>Difficulty:</strong> {info['difficulty']}</p>
+              <p class="disclaimer">
+                ⚠️ AsanaAI is an educational tool for beginner practitioners.
                 It does not replace certified yoga instruction.
-                </p>
+              </p>
             </div>
             """, unsafe_allow_html=True)
 
     st.markdown("---")
 
-# Footer
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2 — DATASET UPLOAD & EDA
+# ═══════════════════════════════════════════════════════════════════════════
+
+with st.expander(
+    "📁  Dataset — Upload & Explore"
+    + (" (dataset loaded)" if st.session_state.dataset_loaded else ""),
+    expanded=not st.session_state.dataset_loaded,
+):
+    st.markdown(
+        "Upload `yoga_dataset.zip` — must contain `train/` and `val/` subfolders, "
+        "each with one folder per class. **Required only for training.**"
+    )
+
+    uploaded_zip = st.file_uploader(
+        "yoga_dataset.zip",
+        type=["zip"],
+        key="dataset_zip",
+        label_visibility="collapsed",
+    )
+
+    # FIX: only process on a fresh upload, not on every rerun
+    if uploaded_zip is not None and not st.session_state.dataset_loaded:
+        with st.spinner("Extracting ZIP…"):
+            dp = process_uploaded_zip(uploaded_zip)
+        if dp:
+            st.session_state.dataset_path   = dp
+            st.session_state.dataset_loaded = True
+            st.success("✅ Dataset extracted successfully.")
+
+    if st.session_state.dataset_loaded:
+        st.markdown('<div class="section-header">📊 <span>EDA — Dataset Overview</span></div>',
+                    unsafe_allow_html=True)
+        show_dataset_summary(st.session_state.dataset_path)
+
+        st.markdown('<div class="section-header">🎨 <span>Augmentation Preview</span></div>',
+                    unsafe_allow_html=True)
+        show_augmentation_preview(st.session_state.dataset_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3 — TRAINING
+# ═══════════════════════════════════════════════════════════════════════════
+
+train_header = (
+    "🚀  Model Training"
+    + (" ✅" if st.session_state.trained else " — required")
+)
+
+with st.expander(train_header, expanded=not st.session_state.trained):
+
+    if st.session_state.trained:
+        src = st.session_state.model_source
+        if src == "file":
+            st.info(
+                "✅ Model loaded from saved checkpoint (`asanai_saved/`). "
+                "Retrain below only if you have uploaded a new dataset."
+            )
+        else:
+            st.success("✅ Model was trained this session.")
+
+    if st.session_state.dataset_loaded:
+        btn_label = "🔄 Retrain model" if st.session_state.trained else "🚀 Begin Training"
+        if st.button(btn_label, type="primary"):
+            prog     = st.progress(0)
+            stat     = st.empty()
+            log_data = []
+
+            with st.spinner("Training… this may take a few minutes."):
+                tl, vl, cnames = create_data_loaders(st.session_state.dataset_path)
+                model, history, stopped_at = run_training(
+                    tl, vl, cnames, prog, stat, log_data
+                )
+
+            # Persist everything
+            save_model(model, history, cnames)
+
+            st.session_state.model        = model
+            st.session_state.history      = history
+            st.session_state.class_names  = cnames
+            st.session_state.val_loader   = vl
+            st.session_state.trained      = True
+            st.session_state.model_source = "trained"
+
+            if stopped_at < EPOCHS:
+                st.success(
+                    f"✅ Training complete — early stopping fired at epoch "
+                    f"**{stopped_at}/{EPOCHS}** (patience={PATIENCE}). "
+                    f"Best weights restored automatically."
+                )
+            else:
+                st.success(f"✅ Training complete — ran all {EPOCHS} epochs.")
+
+            # Epoch log table
+            st.write("**Epoch log**")
+            st.dataframe(pd.DataFrame(log_data).set_index("epoch"),
+                         use_container_width=True)
+
+    else:
+        st.info("Upload the dataset ZIP above to enable training.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4 — TRAINING RESULTS (learning curves)
+# ═══════════════════════════════════════════════════════════════════════════
+
+if st.session_state.trained and st.session_state.history:
+    with st.expander("📈  Training Results — Learning Curves", expanded=True):
+        h = st.session_state.history
+
+        st.markdown(f"""
+        <div class="metric-row">
+          <div class="metric-box"><div class="mval">{h['accuracy'][-1]:.2%}</div><div class="mlbl">Final train acc</div></div>
+          <div class="metric-box"><div class="mval">{h['val_accuracy'][-1]:.2%}</div><div class="mlbl">Final val acc</div></div>
+          <div class="metric-box"><div class="mval">{h['loss'][-1]:.4f}</div><div class="mlbl">Final train loss</div></div>
+          <div class="metric-box"><div class="mval">{h['val_loss'][-1]:.4f}</div><div class="mlbl">Final val loss</div></div>
+          <div class="metric-box"><div class="mval">{len(h['accuracy'])}</div><div class="mlbl">Epochs run</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        plot_learning_curves(h)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 — EVALUATION METRICS
+# ═══════════════════════════════════════════════════════════════════════════
+
+if st.session_state.trained:
+
+    # val_loader may not exist if model was loaded from file without uploading dataset
+    if st.session_state.val_loader is None and st.session_state.dataset_loaded:
+        _, vl, _ = create_data_loaders(st.session_state.dataset_path)
+        st.session_state.val_loader = vl
+
+    if st.session_state.val_loader is not None:
+        with st.expander("📊  Model Evaluation — Full Metrics", expanded=True):
+            with st.spinner("Running inference on validation set…"):
+                y_pred, y_probs, y_true = _get_predictions_cached(
+                    id(st.session_state.model),
+                    id(st.session_state.val_loader),
+                )
+
+            class_names = st.session_state.class_names
+            overall_acc = (y_pred == y_true).mean()
+            st.markdown(f"""
+            <div class="metric-row">
+              <div class="metric-box"><div class="mval">{overall_acc:.2%}</div><div class="mlbl">Overall val accuracy</div></div>
+              <div class="metric-box"><div class="mval">{len(y_true)}</div><div class="mlbl">Val images</div></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            tab_cm, tab_cls, tab_pca, tab_roc = st.tabs([
+                "Confusion Matrix",
+                "Classification Report",
+                "Per-class Accuracy",
+                "ROC Curves",
+            ])
+
+            with tab_cm:
+                fig = plot_confusion_matrix_fig(y_pred, y_true, class_names)
+                st.pyplot(fig); plt.close()
+
+            with tab_cls:
+                show_classification_report(y_pred, y_true, class_names)
+
+            with tab_pca:
+                fig = plot_per_class_accuracy(y_pred, y_true, class_names)
+                st.pyplot(fig); plt.close()
+                st.caption("Green ≥ 80%, orange ≥ 60%, red < 60%")
+
+            with tab_roc:
+                fig = plot_roc_curves(y_probs, y_true, class_names)
+                st.pyplot(fig); plt.close()
+
+    else:
+        st.info(
+            "ℹ️ Evaluation metrics require the validation dataset. "
+            "Upload the dataset ZIP in **Dataset** section above — "
+            "the val loader will be created automatically."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOOTER
+# ═══════════════════════════════════════════════════════════════════════════
+
 st.markdown("---")
 st.markdown("""
-<div style="text-align: center; color: #94a3b8; font-size: 0.85rem; margin-top: 2rem;">
-    <p>AsanaAI is a learning tool. It does not replace certified yoga instruction.</p>
-    <p>Built for CELBC608 — Data Science Laboratory | Semester VI</p>
+<div style="text-align:center;color:#334155;font-size:.8rem;padding:1rem 0 2rem">
+  AsanaAI — CELBC608 Data Science Laboratory · Semester VI ·
+  MobileNetV2 + Grad-CAM · PyTorch
 </div>
 """, unsafe_allow_html=True)
