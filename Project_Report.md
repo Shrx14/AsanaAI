@@ -95,7 +95,8 @@ Typical split used in this project context:
 Backbone:
 
 - `torchvision.models.mobilenet_v2` with ImageNet weights
-- backbone parameters frozen
+- backbone initially frozen for head training
+- staged fine-tuning by unfreezing deeper feature blocks in later epochs
 
 Classifier head:
 
@@ -107,12 +108,18 @@ Classifier head:
 ### 4.3 Training Configuration
 
 - Framework: PyTorch
-- Loss: CrossEntropyLoss
-- Optimizer: Adam
-- Learning rate: 1e-3
-- Batch size: 16
-- Maximum epochs: 10
-- Early stopping patience: 3
+- Loss: CrossEntropyLoss with label smoothing (0.05), with class weighting enabled only if class imbalance is significant
+- Optimizer: AdamW
+- Learning rates: 5e-4 (head phase), 2e-5 (fine-tune phase)
+- LR scheduler: ReduceLROnPlateau (factor=0.5, patience=1, min_lr=1e-6)
+- Weight decay: 1e-4
+- Gradient clipping: 1.0
+- Batch size: 12
+- Maximum epochs: 24
+- Early stopping patience: 6
+- Two-phase training: classifier-head warm-up followed by partial backbone fine-tuning
+- Fine-tuning trigger: from epoch 10, unfreeze feature blocks from index 16 onward
+- MixUp regularization: alpha 0.2 in the initial 10 epochs
 - Device: CUDA (if available), otherwise CPU
 
 ---
@@ -121,17 +128,18 @@ Classifier head:
 
 ### Training transform pipeline
 
-- Resize(128, 128)
-- RandomRotation(15)
-- RandomAffine(scale=(0.9, 1.1))
+- RandomResizedCrop(160, scale=(0.85, 1.0), ratio=(0.85, 1.15))
 - RandomHorizontalFlip
-- ColorJitter(brightness=0.2, contrast=0.2)
+- RandomAffine(degrees=10, translate=(0.04, 0.04), scale=(0.95, 1.05))
+- ColorJitter(brightness=0.12, contrast=0.12, saturation=0.08, hue=0.02)
+- RandomAdjustSharpness(sharpness_factor=1.3, p=0.2)
 - ToTensor
 - Normalize(ImageNet mean/std)
 
 ### Validation transform pipeline
 
-- Resize(128, 128)
+- Resize(184)
+- CenterCrop(160)
 - ToTensor
 - Normalize(ImageNet mean/std)
 
@@ -236,8 +244,10 @@ Note:
 1. Safe dataset extraction and validation logic for ZIP uploads.
 2. Session-state driven UI flow without forced rerun hacks.
 3. Best-weight restoration using deep-copied model state.
-4. Cached evaluation inference to avoid duplicate forward passes.
-5. Clear separation between training, evaluation, and prediction paths.
+4. Two-stage transfer-learning strategy (head training then partial backbone fine-tuning).
+5. Class-balanced loss and adaptive LR scheduling to improve validation generalization.
+6. Cached evaluation inference to avoid duplicate forward passes.
+7. Clear separation between training, evaluation, and prediction paths.
 
 ---
 
@@ -261,7 +271,7 @@ for model development, analysis, and interpretability.
 
 ## 14. Future Scope
 
-1. Selective unfreezing and fine-tuning for higher accuracy.
+1. Automated hyperparameter search (augmentations, scheduler, and regularization sweeps).
 2. More classes and larger, more diverse datasets.
 3. Lightweight export and deployment paths.
 4. Pose-keypoint based corrective suggestions.

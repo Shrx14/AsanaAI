@@ -101,11 +101,15 @@ Training writes these files under `asanai_saved/`:
 
 ## Training defaults (from app constants)
 
-- Image size: 128 x 128
-- Batch size: 16
-- Epochs: 10
-- Early stopping patience: 3
-- Optimizer LR: 1e-3
+- Image size: 160 x 160
+- Batch size: 12
+- Epochs: 24
+- Early stopping patience: 6
+- Optimizer: AdamW (two-stage: head training then partial backbone fine-tuning)
+- Learning rates: 5e-4 (head), 2e-5 (fine-tune)
+- Label smoothing: 0.05
+- Weight decay: 1e-4
+- MixUp: alpha 0.2 (first 10 epochs)
 
 ## Optional verification
 

@@ -21,7 +21,7 @@ import seaborn as sns
 import cv2
 
 from torchvision import models, transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 from PIL import Image
@@ -31,11 +31,20 @@ SAVE_DIR     = "asanai_saved"
 MODEL_PATH   = os.path.join(SAVE_DIR, "model_weights.pt")
 HISTORY_PATH = os.path.join(SAVE_DIR, "training_history.json")
 CLASSES_PATH = os.path.join(SAVE_DIR, "class_names.json")
-IMG_SIZE     = 128
-BATCH_SIZE   = 16
-EPOCHS       = 10
-PATIENCE     = 3
-LR           = 1e-3
+IMG_SIZE     = 160
+BATCH_SIZE   = 12
+EPOCHS       = 24
+PATIENCE     = 6
+LR_HEAD      = 5e-4
+LR_FINE_TUNE = 2e-5
+WEIGHT_DECAY = 1e-4
+LABEL_SMOOTH = 0.05
+GRAD_CLIP    = 1.0
+FINE_TUNE_AT_EPOCH = 10
+UNFREEZE_FROM_BLOCK = 16
+CLASS_WEIGHT_IMBALANCE_THRESHOLD = 1.5
+MIXUP_ALPHA = 0.2
+MIXUP_EPOCHS = 10
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -60,6 +69,7 @@ _defaults = {
     "trained":        False,
     "class_names":    [],
     "history":        None,
+    "temperature":    1.0,
     "dataset_path":   None,
     "val_loader":     None,
     "dataset_loaded": False,
@@ -69,6 +79,17 @@ _defaults = {
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def load_image_rgb(image_source):
+    """Open an image and safely convert to RGB across PNG palette edge-cases."""
+    with Image.open(image_source) as img:
+        # Pillow warns on some palette PNGs unless they pass through RGBA first.
+        if (img.mode == "P" and
+            "transparency" in img.info and
+            isinstance(img.info["transparency"], bytes)):
+            img = img.convert("RGBA")
+        return img.convert("RGB")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # REFERENCE DATA
@@ -299,7 +320,7 @@ class ImageDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        img = Image.open(self.images[idx]).convert("RGB")
+        img = load_image_rgb(self.images[idx])
         if self.transform:
             img = self.transform(img)
         return img, self.labels[idx]
@@ -333,23 +354,25 @@ class YogaPoseModel(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 TRAIN_TRANSFORMS = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomRotation(15),
-    transforms.RandomAffine(degrees=0, scale=(0.9, 1.1)),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0), ratio=(0.85, 1.15)),
     transforms.RandomHorizontalFlip(),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.RandomAffine(degrees=10, translate=(0.04, 0.04), scale=(0.95, 1.05)),
+    transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.08, hue=0.02),
+    transforms.RandomAdjustSharpness(sharpness_factor=1.3, p=0.2),
     transforms.ToTensor(),
     transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
 ])
 
 VAL_TRANSFORMS = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Resize(int(IMG_SIZE * 1.15)),
+    transforms.CenterCrop(IMG_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
 ])
 
 PRED_TRANSFORM = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Resize(int(IMG_SIZE * 1.15)),
+    transforms.CenterCrop(IMG_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
 ])
@@ -395,6 +418,7 @@ if not st.session_state.trained:
         st.session_state.model        = _model
         st.session_state.history      = _hist
         st.session_state.class_names  = _cls
+        st.session_state.temperature  = float(_hist.get("temperature", 1.0))
         st.session_state.trained      = True
         st.session_state.model_source = "file"
 
@@ -440,11 +464,32 @@ def process_uploaded_zip(uploaded_file):
     return dataset_root
 
 
-def create_data_loaders(dataset_path):
+def create_data_loaders(dataset_path, use_weighted_sampler=False):
     train_ds = ImageDataset(os.path.join(dataset_path, "train"), TRAIN_TRANSFORMS)
     val_ds   = ImageDataset(os.path.join(dataset_path, "val"),   VAL_TRANSFORMS)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+    if use_weighted_sampler:
+        counts = np.bincount(train_ds.labels, minlength=len(train_ds.class_names))
+        per_class_weights = 1.0 / np.maximum(counts, 1)
+        sample_weights = torch.tensor(
+            [per_class_weights[label] for label in train_ds.labels],
+            dtype=torch.double,
+        )
+        sampler = WeightedRandomSampler(
+            sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=0,
+        )
+    else:
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     return train_loader, val_loader, train_ds.class_names
@@ -516,9 +561,9 @@ def show_dataset_summary(dataset_path):
             imgs    = sorted(f for f in os.listdir(cls_dir)
                              if f.lower().endswith((".jpg", ".jpeg", ".png")))
             if imgs:
-                img = Image.open(os.path.join(cls_dir, imgs[0])).convert("RGB")
+                img = load_image_rgb(os.path.join(cls_dir, imgs[0]))
                 cols[i % 4].image(img, caption=cls.replace("_", " ").title(),
-                                  use_container_width=True)
+                                  width="stretch")
 
 
 def show_augmentation_preview(dataset_path):
@@ -534,7 +579,7 @@ def show_augmentation_preview(dataset_path):
     if not imgs:
         return
 
-    base_img = Image.open(os.path.join(cls_dir, imgs[0])).convert("RGB")
+    base_img = load_image_rgb(os.path.join(cls_dir, imgs[0]))
     st.write(f"**Showing 6 random augmentations of one `{classes[0].replace('_',' ').title()}` image**")
     st.caption("Each is unique — rotation, flip, zoom, brightness vary randomly. "
                "Validation images are never augmented.")
@@ -547,7 +592,7 @@ def show_augmentation_preview(dataset_path):
         std  = torch.tensor(IMAGENET_STD).view(3,1,1)
         disp = torch.clamp(aug * std + mean, 0, 1)
         disp = (disp.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        col.image(disp, use_container_width=True)
+        col.image(disp, width="stretch")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -555,34 +600,124 @@ def show_augmentation_preview(dataset_path):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_training(train_loader, val_loader, class_names,
-                 progress_bar, status_text, epoch_log):
+                 progress_bar, status_text, epoch_log,
+                 class_weight_mode="auto"):
     num_classes = len(class_names)
     model       = YogaPoseModel(num_classes).to(DEVICE)
-    criterion   = nn.CrossEntropyLoss()
-    optimizer   = optim.Adam(model.parameters(), lr=LR)
+
+    labels = np.array(train_loader.dataset.labels)
+    counts = np.bincount(labels, minlength=num_classes)
+    imbalance_ratio = counts.max() / max(counts.min(), 1)
+
+    class_weights = None
+    enable_class_weights = (
+        class_weight_mode == "force" or
+        (class_weight_mode == "auto" and imbalance_ratio >= CLASS_WEIGHT_IMBALANCE_THRESHOLD)
+    )
+    if enable_class_weights:
+        class_weights_np = counts.sum() / np.maximum(counts, 1)
+        class_weights_np = class_weights_np / class_weights_np.mean()
+        class_weights = torch.tensor(
+            class_weights_np,
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=LABEL_SMOOTH,
+    )
+
+    optimizer = optim.AdamW(
+        model.base_model.classifier.parameters(),
+        lr=LR_HEAD,
+        weight_decay=WEIGHT_DECAY,
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=1,
+        min_lr=1e-6,
+    )
 
     best_val_loss     = float("inf")
+    best_val_acc      = 0.0
+    best_epoch        = 1
     patience_counter  = 0
     best_state        = copy.deepcopy(model.state_dict())   # FIX: deep copy
     stopped_early_at  = EPOCHS
+    fine_tune_enabled = False
 
-    history = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
+    history = {
+        "loss": [],
+        "accuracy": [],
+        "val_loss": [],
+        "val_accuracy": [],
+        "lr": [],
+    }
 
     for epoch in range(EPOCHS):
+        if (not fine_tune_enabled) and (epoch + 1 >= FINE_TUNE_AT_EPOCH):
+            for p in model.base_model.parameters():
+                p.requires_grad = False
+            for idx, block in enumerate(model.base_model.features):
+                if idx >= UNFREEZE_FROM_BLOCK:
+                    for p in block.parameters():
+                        p.requires_grad = True
+
+            optimizer = optim.AdamW(
+                (p for p in model.parameters() if p.requires_grad),
+                lr=LR_FINE_TUNE,
+                weight_decay=WEIGHT_DECAY,
+            )
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.5,
+                patience=1,
+                min_lr=1e-6,
+            )
+            fine_tune_enabled = True
+
+        mixup_this_epoch = MIXUP_ALPHA > 0 and (epoch + 1) <= MIXUP_EPOCHS
+
         # ── Training phase ─────────────────────────────────────────────────
         model.train()
-        t_loss, t_correct, t_total = 0.0, 0, 0
+        t_loss, t_correct, t_total = 0.0, 0.0, 0
         for images, labels in train_loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
-            optimizer.zero_grad()
-            out  = model(images)
-            loss = criterion(out, labels)
+            optimizer.zero_grad(set_to_none=True)
+
+            if mixup_this_epoch:
+                lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+                shuffle_idx = torch.randperm(images.size(0), device=images.device)
+                mixed_images = lam * images + (1.0 - lam) * images[shuffle_idx]
+                labels_a, labels_b = labels, labels[shuffle_idx]
+
+                out = model(mixed_images)
+                loss = lam * criterion(out, labels_a) + (1.0 - lam) * criterion(out, labels_b)
+            else:
+                out = model(images)
+                loss = criterion(out, labels)
+
             loss.backward()
+
+            if GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    GRAD_CLIP,
+                )
+
             optimizer.step()
             t_loss    += loss.item()
             _, pred    = torch.max(out, 1)
             t_total   += labels.size(0)
-            t_correct += (pred == labels).sum().item()
+            if mixup_this_epoch:
+                t_correct += lam * (pred == labels_a).sum().item()
+                t_correct += (1.0 - lam) * (pred == labels_b).sum().item()
+            else:
+                t_correct += (pred == labels).sum().item()
 
         t_loss /= len(train_loader)
         t_acc   = t_correct / t_total
@@ -603,24 +738,40 @@ def run_training(train_loader, val_loader, class_names,
         v_loss /= len(val_loader)
         v_acc   = v_correct / v_total
 
+        scheduler.step(v_loss)
+        current_lr = optimizer.param_groups[0]["lr"]
+
         history["loss"].append(round(t_loss, 5))
         history["accuracy"].append(round(t_acc, 5))
         history["val_loss"].append(round(v_loss, 5))
         history["val_accuracy"].append(round(v_acc, 5))
+        history["lr"].append(float(current_lr))
 
         progress_bar.progress((epoch + 1) / EPOCHS)
+        phase = "head" if not fine_tune_enabled else "fine-tune"
+        aug_mode = "mixup" if mixup_this_epoch else "standard"
         status_text.markdown(
             f"**Epoch {epoch+1}/{EPOCHS}** — "
-            f"Train Acc: `{t_acc:.4f}` | Val Acc: `{v_acc:.4f}` | Val Loss: `{v_loss:.4f}`"
+            f"Train Acc: `{t_acc:.4f}` | Val Acc: `{v_acc:.4f}` | "
+            f"Val Loss: `{v_loss:.4f}` | LR: `{current_lr:.2e}` | "
+            f"Phase: `{phase}` | Aug: `{aug_mode}`"
         )
         epoch_log.append(
             {"epoch": epoch + 1, "train_acc": round(t_acc, 4),
-             "val_acc": round(v_acc, 4), "val_loss": round(v_loss, 4)}
+             "val_acc": round(v_acc, 4), "val_loss": round(v_loss, 4),
+             "lr": float(current_lr), "phase": phase, "aug": aug_mode}
         )
 
         # ── Early stopping ──────────────────────────────────────────────────
-        if v_loss < best_val_loss:
+        improved = (
+            (v_acc > best_val_acc + 1e-6) or
+            (abs(v_acc - best_val_acc) <= 1e-6 and v_loss < best_val_loss)
+        )
+
+        if improved:
+            best_val_acc     = v_acc
             best_val_loss    = v_loss
+            best_epoch       = epoch + 1
             patience_counter = 0
             best_state       = copy.deepcopy(model.state_dict())   # FIX: deep copy
         else:
@@ -632,7 +783,71 @@ def run_training(train_loader, val_loader, class_names,
 
     model.load_state_dict(best_state)
     model.eval()
+
+    history["best_epoch"] = best_epoch
+    history["best_val_accuracy"] = round(float(best_val_acc), 5)
+    history["best_val_loss"] = round(float(best_val_loss), 5)
+    history["class_weighting"] = (
+        "enabled" if class_weights is not None else "disabled"
+    )
+    history["class_weight_mode"] = class_weight_mode
+    history["imbalance_ratio"] = round(float(imbalance_ratio), 3)
+    history["temperature"] = round(float(fit_temperature(model, val_loader)), 4)
+
     return model, history, stopped_early_at
+
+
+def fit_temperature(model, val_loader):
+    """Estimate a post-hoc temperature on validation logits for confidence calibration."""
+    model.eval()
+    logits_list, labels_list = [], []
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            out = model(images.to(DEVICE))
+            logits_list.append(out.detach().cpu())
+            labels_list.append(labels.cpu())
+
+    if not logits_list:
+        return 1.0
+
+    logits = torch.cat(logits_list, dim=0)
+    labels = torch.cat(labels_list, dim=0)
+
+    # Lightweight grid search is stable on small datasets and avoids optimizer edge-cases.
+    temperature_grid = np.linspace(0.5, 2.5, 41)
+    best_temp = 1.0
+    best_nll = float("inf")
+
+    for temp in temperature_grid:
+        nll = nn.functional.cross_entropy(logits / float(temp), labels).item()
+        if nll < best_nll:
+            best_nll = nll
+            best_temp = float(temp)
+
+    return best_temp
+
+
+def get_temperature():
+    """Return safe calibration temperature for probability scaling."""
+    temp = float(st.session_state.get("temperature", 1.0))
+    return max(0.5, min(2.5, temp))
+
+
+def ensure_temperature_calibrated():
+    """Calibrate confidence once when history lacks a temperature value."""
+    if not st.session_state.trained:
+        return
+    if st.session_state.model is None or st.session_state.val_loader is None:
+        return
+    if st.session_state.history is None:
+        return
+    if "temperature" in st.session_state.history:
+        return
+
+    temp = fit_temperature(st.session_state.model, st.session_state.val_loader)
+    st.session_state.temperature = float(temp)
+    st.session_state.history["temperature"] = round(float(temp), 4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -640,7 +855,7 @@ def run_training(train_loader, val_loader, class_names,
 # ═══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def _get_predictions_cached(_model_id, _val_loader_id):
+def _get_predictions_cached(_model_id, _val_loader_id, _temperature):
     """
     Cache predictions so confusion matrix / report / ROC don't each
     run a full forward pass.  _model_id / _val_loader_id are just
@@ -653,8 +868,9 @@ def _get_predictions_cached(_model_id, _val_loader_id):
     with torch.no_grad():
         for imgs, lbls in val_loader:
             out  = model(imgs.to(DEVICE))
-            p    = torch.softmax(out, 1)
-            _, q = torch.max(out, 1)
+            calibrated_out = out / float(_temperature)
+            p = torch.softmax(calibrated_out, 1)
+            _, q = torch.max(calibrated_out, 1)
             preds.extend(q.cpu().numpy())
             probs.extend(p.cpu().numpy())
             labels.extend(lbls.numpy())
@@ -739,7 +955,7 @@ def show_classification_report(y_pred, y_true, class_names):
           .background_gradient(cmap="Blues", subset=["precision", "recall", "f1-score"])
           .format({"precision": "{:.3f}", "recall": "{:.3f}",
                    "f1-score": "{:.3f}", "support": "{:.0f}"}),
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -842,14 +1058,15 @@ def predict_image(uploaded_img):
     model       = st.session_state.model
     class_names = st.session_state.class_names
 
-    img         = Image.open(uploaded_img).convert("RGB")
+    img         = load_image_rgb(uploaded_img)
     img_resized = img.resize((IMG_SIZE, IMG_SIZE))
     img_tensor  = PRED_TRANSFORM(img).unsqueeze(0).to(DEVICE)
 
     model.eval()
     with torch.no_grad():
-        out   = model(img_tensor)
-        probs = torch.softmax(out, 1)[0].cpu().numpy()
+        out = model(img_tensor)
+        calibrated_out = out / get_temperature()
+        probs = torch.softmax(calibrated_out, 1)[0].cpu().numpy()
 
     top3_idx    = np.argsort(probs)[::-1][:3]
     class_idx   = int(top3_idx[0])
@@ -961,9 +1178,9 @@ if st.session_state.trained:
 
         # ── Images ──────────────────────────────────────────────────────────
         c1, c2, c3 = st.columns(3)
-        c1.image(result["img_resized"], caption="📷 Original",         use_container_width=True)
-        c2.image(result["heatmap"],     caption="🔥 Grad-CAM Heatmap",  use_container_width=True)
-        c3.image(result["overlay"],     caption="🔍 Overlay",           use_container_width=True)
+        c1.image(result["img_resized"], caption="📷 Original",         width="stretch")
+        c2.image(result["heatmap"],     caption="🔥 Grad-CAM Heatmap",  width="stretch")
+        c3.image(result["overlay"],     caption="🔍 Overlay",           width="stretch")
 
         st.caption(
             "Grad-CAM: red = strongest influence on prediction, blue = weakest. "
@@ -1089,6 +1306,29 @@ with st.expander(train_header, expanded=not st.session_state.trained):
             st.success("✅ Model was trained this session.")
 
     if st.session_state.dataset_loaded:
+        class_weight_choice = st.selectbox(
+            "Class weighting mode",
+            options=["Auto (recommended)", "Off", "Force on"],
+            index=0,
+            help=(
+                "Auto enables class weights only when imbalance is high. "
+                "Use Off for an ablation run."
+            ),
+        )
+        use_weighted_sampler = st.checkbox(
+            "Use weighted sampler (experimental)",
+            value=False,
+            help="Oversamples underrepresented classes in training batches.",
+        )
+        st.caption("Tip: run one experiment with class weighting Off to compare class precision/recall trade-offs.")
+
+        class_weight_mode_map = {
+            "Auto (recommended)": "auto",
+            "Off": "off",
+            "Force on": "force",
+        }
+        class_weight_mode = class_weight_mode_map[class_weight_choice]
+
         btn_label = "🔄 Retrain model" if st.session_state.trained else "🚀 Begin Training"
         if st.button(btn_label, type="primary"):
             prog     = st.progress(0)
@@ -1096,10 +1336,15 @@ with st.expander(train_header, expanded=not st.session_state.trained):
             log_data = []
 
             with st.spinner("Training… this may take a few minutes."):
-                tl, vl, cnames = create_data_loaders(st.session_state.dataset_path)
-                model, history, stopped_at = run_training(
-                    tl, vl, cnames, prog, stat, log_data
+                tl, vl, cnames = create_data_loaders(
+                    st.session_state.dataset_path,
+                    use_weighted_sampler=use_weighted_sampler,
                 )
+                model, history, stopped_at = run_training(
+                    tl, vl, cnames, prog, stat, log_data,
+                    class_weight_mode=class_weight_mode,
+                )
+                history["sampler"] = "weighted" if use_weighted_sampler else "standard"
 
             # Persist everything
             save_model(model, history, cnames)
@@ -1108,6 +1353,7 @@ with st.expander(train_header, expanded=not st.session_state.trained):
             st.session_state.history      = history
             st.session_state.class_names  = cnames
             st.session_state.val_loader   = vl
+            st.session_state.temperature  = float(history.get("temperature", 1.0))
             st.session_state.trained      = True
             st.session_state.model_source = "trained"
 
@@ -1123,7 +1369,7 @@ with st.expander(train_header, expanded=not st.session_state.trained):
             # Epoch log table
             st.write("**Epoch log**")
             st.dataframe(pd.DataFrame(log_data).set_index("epoch"),
-                         use_container_width=True)
+                         width="stretch")
 
     else:
         st.info("Upload the dataset ZIP above to enable training.")
@@ -1136,16 +1382,31 @@ with st.expander(train_header, expanded=not st.session_state.trained):
 if st.session_state.trained and st.session_state.history:
     with st.expander("📈  Training Results — Learning Curves", expanded=True):
         h = st.session_state.history
+        best_epoch = int(h.get("best_epoch", np.argmax(h["val_accuracy"]) + 1))
+        best_idx = max(0, min(best_epoch - 1, len(h["val_accuracy"]) - 1))
+        best_val_acc = h["val_accuracy"][best_idx]
+        best_val_loss = h["val_loss"][best_idx]
+        class_weighting = h.get("class_weighting", "not recorded")
+        class_weight_mode = h.get("class_weight_mode", "not recorded")
+        sampler_mode = h.get("sampler", "standard")
+        calibration_temp = float(h.get("temperature", st.session_state.temperature))
 
         st.markdown(f"""
         <div class="metric-row">
           <div class="metric-box"><div class="mval">{h['accuracy'][-1]:.2%}</div><div class="mlbl">Final train acc</div></div>
-          <div class="metric-box"><div class="mval">{h['val_accuracy'][-1]:.2%}</div><div class="mlbl">Final val acc</div></div>
+          <div class="metric-box"><div class="mval">{best_val_acc:.2%}</div><div class="mlbl">Best val acc</div></div>
           <div class="metric-box"><div class="mval">{h['loss'][-1]:.4f}</div><div class="mlbl">Final train loss</div></div>
-          <div class="metric-box"><div class="mval">{h['val_loss'][-1]:.4f}</div><div class="mlbl">Final val loss</div></div>
+          <div class="metric-box"><div class="mval">{best_val_loss:.4f}</div><div class="mlbl">Val loss @ best acc</div></div>
           <div class="metric-box"><div class="mval">{len(h['accuracy'])}</div><div class="mlbl">Epochs run</div></div>
         </div>
         """, unsafe_allow_html=True)
+
+        st.caption(
+            f"Best validation epoch: {best_epoch}. "
+            f"Class weighting: {class_weighting} ({class_weight_mode}). "
+            f"Sampler: {sampler_mode}. "
+            f"Confidence temperature: {calibration_temp:.2f}."
+        )
 
         plot_learning_curves(h)
 
@@ -1162,11 +1423,16 @@ if st.session_state.trained:
         st.session_state.val_loader = vl
 
     if st.session_state.val_loader is not None:
+        if "temperature" not in (st.session_state.history or {}):
+            with st.spinner("Calibrating confidence on validation set…"):
+                ensure_temperature_calibrated()
+
         with st.expander("📊  Model Evaluation — Full Metrics", expanded=True):
             with st.spinner("Running inference on validation set…"):
                 y_pred, y_probs, y_true = _get_predictions_cached(
                     id(st.session_state.model),
                     id(st.session_state.val_loader),
+                    round(get_temperature(), 4),
                 )
 
             class_names = st.session_state.class_names
