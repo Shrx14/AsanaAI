@@ -767,15 +767,19 @@ def show_dataset_summary(dataset_path):
     with col_samples:
         st.write("**Sample images (one per class)**")
         train_path = os.path.join(dataset_path, "train")
-        cols       = st.columns(4)
-        for i, cls in enumerate(classes[:8]):
+        num_cols   = 4
+        cols       = st.columns(num_cols)
+        for i, cls in enumerate(classes):
             cls_dir = os.path.join(train_path, cls)
             imgs    = sorted(f for f in os.listdir(cls_dir)
                              if f.lower().endswith((".jpg", ".jpeg", ".png")))
             if imgs:
                 img = load_image_rgb(os.path.join(cls_dir, imgs[0]))
-                cols[i % 4].image(img, caption=cls.replace("_", " ").title(),
-                                  use_container_width=True)
+                cols[i % num_cols].image(
+                    img,
+                    caption=cls.replace("_", " ").title(),
+                    use_container_width=True,
+                )
 
 
 def show_augmentation_preview(dataset_path):
@@ -1047,14 +1051,22 @@ def get_temperature():
 
 
 def ensure_temperature_calibrated():
-    """Calibrate confidence once when history lacks a temperature value."""
+    """Calibrate confidence when stored temperature is missing or default."""
     if not st.session_state.trained:
         return
     if st.session_state.model is None or st.session_state.val_loader is None:
         return
     if st.session_state.history is None:
         return
-    if "temperature" in st.session_state.history:
+
+    temp_from_history = st.session_state.history.get("temperature")
+    try:
+        needs_calibration = (not temp_from_history) or float(temp_from_history) == 1.0
+    except (TypeError, ValueError):
+        needs_calibration = True
+
+    if not needs_calibration:
+        st.session_state.temperature = float(temp_from_history)
         return
 
     temp = fit_temperature(st.session_state.model, st.session_state.val_loader)
@@ -1206,6 +1218,7 @@ def plot_learning_curves(history):
 
     ep = list(range(1, len(history["accuracy"]) + 1))
     best_ep = int(history.get("best_epoch", 1))
+    tick_step = max(1, len(ep) // 6) if ep else 1
     if ep:
         best_ep = max(ep[0], min(best_ep, ep[-1]))
 
@@ -1215,7 +1228,7 @@ def plot_learning_curves(history):
     ax1.set_title("Accuracy", color="white", fontsize=12)
     ax1.set_xlabel("Epoch", color="#94a3b8"); ax1.set_ylabel("Accuracy", color="#94a3b8")
     ax1.legend(facecolor="#1f2937", labelcolor="white")
-    ax1.set_xticks(ep)
+    ax1.set_xticks(ep[::tick_step])
 
     ax2.plot(ep, history["loss"],     color="#667eea", lw=2.5, label="Train")
     ax2.plot(ep, history["val_loss"], color="#f59e0b", lw=2.5, ls="--", label="Val")
@@ -1223,7 +1236,7 @@ def plot_learning_curves(history):
     ax2.set_title("Loss", color="white", fontsize=12)
     ax2.set_xlabel("Epoch", color="#94a3b8"); ax2.set_ylabel("Loss", color="#94a3b8")
     ax2.legend(facecolor="#1f2937", labelcolor="white")
-    ax2.set_xticks(ep)
+    ax2.set_xticks(ep[::tick_step])
 
     plt.tight_layout()
     st.pyplot(fig); plt.close()
@@ -1332,8 +1345,14 @@ def plot_roc_curves(y_probs, y_true, class_names):
     ax.set_ylabel("True Positive Rate",  color="#94a3b8")
     ax.set_title("ROC Curves — One-vs-Rest", color="white", fontsize=13)
     if plotted > 0:
-        ax.legend(loc="lower right", fontsize=8,
-                  facecolor="#1f2937", labelcolor="white", framealpha=0.8)
+        ax.legend(
+            loc="lower right",
+            fontsize=7,
+            facecolor="#1f2937",
+            labelcolor="white",
+            framealpha=0.8,
+            ncol=2,
+        )
     else:
         ax.text(
             0.5,
@@ -1381,7 +1400,6 @@ def get_last_conv_layer(model):
 
 def generate_gradcam(model, img_tensor, class_idx):
     """Return (heatmap_rgb, overlay_rgb) as uint8 numpy arrays."""
-    model.eval()
     activations, gradients = [], []
 
     target_layer = get_last_conv_layer(model)
@@ -1744,7 +1762,8 @@ if show_webcam:
         )
 
         if webcam_mode == "Real-time stream (WebRTC)":
-            st.session_state.webcam_active = True
+            # Keep snapshot camera controls independent from WebRTC streaming.
+            st.session_state.webcam_active = False
             if WEBRTC_AVAILABLE:
                 st.caption("Real-time streaming is active. Allow browser camera access when prompted.")
                 webrtc_streamer(
@@ -1791,7 +1810,6 @@ if show_webcam:
                     "Refresh delay (seconds)",
                     min_value=0.5,
                     max_value=2.5,
-                    value=float(st.session_state.webcam_refresh_interval),
                     step=0.1,
                     key="webcam_refresh_interval",
                     disabled=not st.session_state.webcam_active,
@@ -2097,9 +2115,17 @@ if show_evaluation:
             st.session_state.val_loader = vl
 
         if st.session_state.val_loader is not None:
-            if "temperature" not in (st.session_state.history or {}):
+            history_temp = (st.session_state.history or {}).get("temperature")
+            try:
+                needs_calibration = (not history_temp) or float(history_temp) == 1.0
+            except (TypeError, ValueError):
+                needs_calibration = True
+
+            if needs_calibration:
                 with st.spinner("Calibrating confidence on validation set..."):
                     ensure_temperature_calibrated()
+            else:
+                st.session_state.temperature = float(history_temp)
 
             with st.expander("📊  Model Evaluation — Full Metrics", expanded=True):
                 with st.spinner("Running inference on validation set..."):
