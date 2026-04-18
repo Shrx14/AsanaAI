@@ -24,7 +24,7 @@ from torchvision import models, transforms
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 from sklearn.preprocessing import label_binarize
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 # ── CONSTANTS ────────────────────────────────────────────────────────────────
 SAVE_DIR     = "asanai_saved"
@@ -303,6 +303,7 @@ class ImageDataset(Dataset):
         self.transform   = transform
         self.images      = []
         self.labels      = []
+        self.skipped_images = []
         self.class_names = sorted(
             d for d in os.listdir(root_dir)
             if os.path.isdir(os.path.join(root_dir, d))
@@ -313,7 +314,13 @@ class ImageDataset(Dataset):
             cls_dir = os.path.join(root_dir, cls)
             for fname in sorted(os.listdir(cls_dir)):
                 if fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                    self.images.append(os.path.join(cls_dir, fname))
+                    image_path = os.path.join(cls_dir, fname)
+                    try:
+                        load_image_rgb(image_path)
+                    except (OSError, UnidentifiedImageError, ValueError) as exc:
+                        self.skipped_images.append({"path": image_path, "error": str(exc)})
+                        continue
+                    self.images.append(image_path)
                     self.labels.append(self.class_to_idx[cls])
 
     def __len__(self):
@@ -492,7 +499,31 @@ def create_data_loaders(dataset_path, use_weighted_sampler=False):
 
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    return train_loader, val_loader, train_ds.class_names
+    skipped_summary = {
+        "train": train_ds.skipped_images,
+        "val": val_ds.skipped_images,
+    }
+
+    return train_loader, val_loader, train_ds.class_names, skipped_summary
+
+
+def show_skipped_images_warning(skipped_summary):
+    train_skipped = skipped_summary.get("train", [])
+    val_skipped = skipped_summary.get("val", [])
+    total_skipped = len(train_skipped) + len(val_skipped)
+    if total_skipped == 0:
+        return
+
+    preview_paths = [
+        os.path.basename(item["path"])
+        for item in (train_skipped + val_skipped)[:5]
+    ]
+    preview = ", ".join(preview_paths)
+    st.warning(
+        "Skipped unreadable images while building the dataset "
+        f"(train: {len(train_skipped)}, val: {len(val_skipped)}). "
+        f"Examples: {preview}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1336,10 +1367,11 @@ with st.expander(train_header, expanded=not st.session_state.trained):
             log_data = []
 
             with st.spinner("Training… this may take a few minutes."):
-                tl, vl, cnames = create_data_loaders(
+                tl, vl, cnames, skipped = create_data_loaders(
                     st.session_state.dataset_path,
                     use_weighted_sampler=use_weighted_sampler,
                 )
+                show_skipped_images_warning(skipped)
                 model, history, stopped_at = run_training(
                     tl, vl, cnames, prog, stat, log_data,
                     class_weight_mode=class_weight_mode,
@@ -1419,7 +1451,8 @@ if st.session_state.trained:
 
     # val_loader may not exist if model was loaded from file without uploading dataset
     if st.session_state.val_loader is None and st.session_state.dataset_loaded:
-        _, vl, _ = create_data_loaders(st.session_state.dataset_path)
+        _, vl, _, skipped = create_data_loaders(st.session_state.dataset_path)
+        show_skipped_images_warning(skipped)
         st.session_state.val_loader = vl
 
     if st.session_state.val_loader is not None:
