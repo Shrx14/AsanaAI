@@ -22,6 +22,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import cv2
+import mediapipe as mp
 
 from torchvision import models, transforms
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -312,7 +313,7 @@ st.markdown("""
     border-color: rgba(245,158,11,.25);
   }
   .status-dot {
-    width: 10px; height: 10px; border-radius: 50%;
+    width: 0.65rem; height: 0.65rem; border-radius: 50%;
     background: #10b981; flex-shrink: 0;
     box-shadow: 0 0 6px #10b981;
         animation: glowPulse 2.2s ease-in-out infinite;
@@ -375,8 +376,8 @@ st.markdown("""
         animation: fadeUp .35s ease-out both;
     }
     .confidence-ring {
-        width: 60px;
-        height: 60px;
+        width: 3.75rem;
+        height: 3.75rem;
         border-radius: 50%;
         display: grid;
         place-items: center;
@@ -415,10 +416,10 @@ st.markdown("""
   }
   .top3-label { flex: 1; font-size: .85rem; color: #cbd5e1; }
   .top3-pct { font-size: .85rem; font-weight: 600; color: #a5b4fc;
-    min-width: 42px; text-align: right; }
-  .top3-bar-bg { width: 100px; background: rgba(255,255,255,.06);
-    border-radius: 4px; height: 5px; }
-  .top3-bar { height: 5px; border-radius: 4px; background: #667eea; }
+    min-width: 2.6rem; text-align: right; }
+  .top3-bar-bg { flex: 0 0 30%; background: rgba(255,255,255,.06);
+    border-radius: 4px; height: .32rem; }
+  .top3-bar { height: .32rem; border-radius: 4px; background: #667eea; }
 
   .info-card {
     background: rgba(16,185,129,.04);
@@ -447,6 +448,55 @@ st.markdown("""
   }
 
   .aug-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: .5rem; }
+
+  /* ── Viewport-fit: scale everything with zoom ──────────────────────── */
+  .main .block-container {
+    max-width: 100% !important;
+    padding-top: 1rem !important;
+    padding-bottom: 1rem !important;
+  }
+
+  /* All matplotlib / pyplot charts scale to container */
+  .stPlotlyChart, .stPyplot {
+    width: 100% !important;
+  }
+  .stPyplot img, .stPyplot > div > img {
+    width: 100% !important;
+    height: auto !important;
+    max-height: 70vh !important;
+    object-fit: contain !important;
+  }
+
+  /* Dataframes fill their container */
+  .stDataFrame { width: 100% !important; }
+
+  /* WebRTC video element – scale to fit viewport */
+  iframe[title="streamlit_webrtc.component"],
+  video {
+    max-height: 60vh !important;
+    width: 100% !important;
+    object-fit: contain !important;
+  }
+
+  /* Streamlit camera input – same constraint */
+  .stCameraInput video,
+  .stCameraInput img {
+    max-height: 55vh !important;
+    object-fit: contain !important;
+  }
+
+  /* Streamlit image elements scale to container */
+  .stImage img {
+    max-width: 100% !important;
+    height: auto !important;
+    max-height: 55vh !important;
+    object-fit: contain !important;
+  }
+
+  /* Metric boxes scale */
+  [data-testid="stMetric"] {
+    width: 100% !important;
+  }
 
   footer { visibility: hidden; }
 </style>
@@ -762,7 +812,7 @@ def show_dataset_summary(dataset_path):
         ax.set_title("Images per class", color="white", fontsize=11, pad=10)
         ax.legend(facecolor="#1f2937", labelcolor="white", fontsize=9)
         ax.tick_params(colors="#94a3b8"); ax.grid(axis="x", alpha=0.1)
-        plt.tight_layout(); st.pyplot(fig); plt.close()
+        plt.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close()
 
     with col_samples:
         st.write("**Sample images (one per class)**")
@@ -1146,6 +1196,79 @@ def get_similarity_hint(cls_a, cls_b):
     return SIMILAR_POSES.get(key, "")
 
 
+# ── MediaPipe Pose setup (Tasks API) ─────────────────────────────────────────
+from mediapipe.tasks.python import BaseOptions as _MPBaseOptions
+from mediapipe.tasks.python.vision import (
+    PoseLandmarker as _PoseLandmarker,
+    PoseLandmarkerOptions as _PoseLandmarkerOptions,
+    PoseLandmarksConnections as _PoseConns,
+    RunningMode as _RunningMode,
+)
+
+_POSE_MODEL_PATH = os.path.join(SAVE_DIR, "pose_landmarker_lite.task")
+_POSE_CONNECTIONS = _PoseConns.POSE_LANDMARKS
+
+
+def _ensure_pose_model():
+    """Download the Pose Landmarker model if not present."""
+    if os.path.exists(_POSE_MODEL_PATH):
+        return
+    import urllib.request
+    url = (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "pose_landmarker/pose_landmarker_lite/float16/latest/"
+        "pose_landmarker_lite.task"
+    )
+    urllib.request.urlretrieve(url, _POSE_MODEL_PATH)
+
+
+def draw_pose_landmarks(bgr_frame, min_detection_confidence=0.5):
+    """Run MediaPipe PoseLandmarker on a BGR frame and draw skeleton.
+    Returns the annotated frame and the detection result."""
+    _ensure_pose_model()
+
+    options = _PoseLandmarkerOptions(
+        base_options=_MPBaseOptions(model_asset_path=_POSE_MODEL_PATH),
+        running_mode=_RunningMode.IMAGE,
+        min_pose_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=0.5,
+    )
+
+    with _PoseLandmarker.create_from_options(options) as landmarker:
+        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = landmarker.detect(mp_image)
+
+        if result.pose_landmarks:
+            h, w = bgr_frame.shape[:2]
+            for pose_lms in result.pose_landmarks:
+                # Draw connections
+                for conn in _POSE_CONNECTIONS:
+                    lm_a = pose_lms[conn.start]
+                    lm_b = pose_lms[conn.end]
+                    ax, ay = int(lm_a.x * w), int(lm_a.y * h)
+                    bx, by = int(lm_b.x * w), int(lm_b.y * h)
+                    min_vis = min(lm_a.visibility, lm_b.visibility)
+                    if min_vis > 0.3:
+                        color = (180, 230, 180) if min_vis > 0.6 else (100, 180, 180)
+                        cv2.line(bgr_frame, (ax, ay), (bx, by), color, 2, cv2.LINE_AA)
+
+                # Draw landmarks with color by visibility
+                for lm in pose_lms:
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    vis = lm.visibility
+                    if vis > 0.7:
+                        color, r = (0, 230, 118), 5
+                    elif vis > 0.4:
+                        color, r = (0, 220, 255), 4
+                    else:
+                        color, r = (80, 80, 255), 3
+                    cv2.circle(bgr_frame, (cx, cy), r, color, -1)
+                    cv2.circle(bgr_frame, (cx, cy), r + 1, (255, 255, 255), 1)
+
+    return bgr_frame, result
+
+
 if WEBRTC_AVAILABLE:
     class YogaVideoProcessor(VideoProcessorBase):
         def __init__(self, model=None, class_names=None, temperature=1.0):
@@ -1160,6 +1283,9 @@ if WEBRTC_AVAILABLE:
             if self.model is None or not self.class_names:
                 return av.VideoFrame.from_ndarray(img, format="bgr24")
 
+            # Draw pose skeleton
+            img, _ = draw_pose_landmarks(img, min_detection_confidence=0.5)
+
             pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             tensor = PRED_TRANSFORM(pil_img).unsqueeze(0).to(DEVICE)
 
@@ -1168,20 +1294,28 @@ if WEBRTC_AVAILABLE:
                 probs = torch.softmax(out / self.temperature, 1)[0].cpu().numpy()
 
             cls_idx = int(np.argmax(probs))
-            cls_name = self.class_names[cls_idx].replace("_", " ").title()
+            cls_key = self.class_names[cls_idx]
+            cls_name = cls_key.replace("_", " ").title()
             conf = float(probs[cls_idx])
             label = f"{cls_name} {conf:.0%}"
 
-            cv2.putText(
-                img,
-                label,
-                (10, 36),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 120),
-                2,
-                cv2.LINE_AA,
-            )
+            # Pose label background
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+            cv2.rectangle(img, (5, 8), (15 + tw, 44 + th), (0, 0, 0), -1)
+            cv2.putText(img, label, (10, 36), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (0, 255, 120), 2, cv2.LINE_AA)
+
+            # Show form cue from pose_info
+            info = pose_info.get(normalize_class_key(cls_key), {})
+            cue = info.get("cues", "")
+            if cue and conf > 0.45:
+                h_img = img.shape[0]
+                # Wrap cue text to fit
+                cue_short = cue[:80] + ("..." if len(cue) > 80 else "")
+                (cw, ch), _ = cv2.getTextSize(cue_short, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(img, (5, h_img - 35 - ch), (15 + cw, h_img - 5), (0, 0, 0), -1)
+                cv2.putText(img, cue_short, (10, h_img - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 230, 255), 1, cv2.LINE_AA)
 
             return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -1239,7 +1373,7 @@ def plot_learning_curves(history):
     ax2.set_xticks(ep[::tick_step])
 
     plt.tight_layout()
-    st.pyplot(fig); plt.close()
+    st.pyplot(fig, use_container_width=True); plt.close()
 
 
 def plot_confusion_matrix_fig(y_pred, y_true, class_names):
@@ -1720,7 +1854,7 @@ if show_predict:
                 ax.set_xlim(0, 1)
                 ax.set_xlabel("Confidence", color="#94a3b8")
                 plt.tight_layout()
-                st.pyplot(fig)
+                st.pyplot(fig, use_container_width=True)
                 plt.close()
 
             info = get_pose_details(cls_key)
@@ -1766,12 +1900,18 @@ if show_webcam:
             st.session_state.webcam_active = False
             if WEBRTC_AVAILABLE:
                 st.caption("Real-time streaming is active. Allow browser camera access when prompted.")
+                # Capture into local vars so the lambda (which runs in a
+                # background thread without ScriptRunContext) doesn't need
+                # to access st.session_state.
+                _model = st.session_state.model
+                _class_names = st.session_state.class_names
+                _temperature = get_temperature()
                 webrtc_streamer(
                     key="yoga_stream",
                     video_processor_factory=lambda: YogaVideoProcessor(
-                        st.session_state.model,
-                        st.session_state.class_names,
-                        get_temperature(),
+                        _model,
+                        _class_names,
+                        _temperature,
                     ),
                     media_stream_constraints={"video": True, "audio": False},
                     async_processing=True,
@@ -1907,9 +2047,15 @@ if show_webcam:
                             </div>
                             """, unsafe_allow_html=True)
 
-                        c1, c2 = st.columns(2)
-                        c1.image(result["img_resized"], caption="Captured Frame", use_container_width=True)
-                        c2.image(result["overlay"], caption="Grad-CAM Overlay", use_container_width=True)
+                        # Generate pose landmark overlay for snapshot
+                        cam_img_bgr = cv2.cvtColor(np.array(result["img_resized"]), cv2.COLOR_RGB2BGR)
+                        pose_img_bgr, _ = draw_pose_landmarks(cam_img_bgr.copy(), min_detection_confidence=0.4)
+                        pose_img_rgb = cv2.cvtColor(pose_img_bgr, cv2.COLOR_BGR2RGB)
+
+                        c1, c2, c3 = st.columns(3)
+                        c1.image(result["img_resized"], caption="📷 Captured", use_container_width=True)
+                        c2.image(pose_img_rgb, caption="🦴 Pose Guide", use_container_width=True)
+                        c3.image(result["overlay"], caption="🔥 Grad-CAM", use_container_width=True)
 
                         info = get_pose_details(smooth_cls)
                         if info and smooth_conf >= CONFIDENCE_THRESHOLD:
@@ -2150,19 +2296,19 @@ if show_evaluation:
 
                 with tab_cm:
                     fig = plot_confusion_matrix_fig(y_pred, y_true, class_names)
-                    st.pyplot(fig); plt.close()
+                    st.pyplot(fig, use_container_width=True); plt.close()
 
                 with tab_cls:
                     show_classification_report(y_pred, y_true, class_names)
 
                 with tab_pca:
                     fig = plot_per_class_accuracy(y_pred, y_true, class_names)
-                    st.pyplot(fig); plt.close()
+                    st.pyplot(fig, use_container_width=True); plt.close()
                     st.caption("Green ≥ 80%, orange ≥ 60%, red < 60%")
 
                 with tab_roc:
                     fig = plot_roc_curves(y_probs, y_true, class_names)
-                    st.pyplot(fig); plt.close()
+                    st.pyplot(fig, use_container_width=True); plt.close()
 
         else:
             st.info(
